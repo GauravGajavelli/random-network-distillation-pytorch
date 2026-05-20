@@ -33,3 +33,4 @@ lib/
 # IDE files
 .idea
 *.iml
+/.venv

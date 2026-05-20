@@ -1,8 +1,11 @@
 from config import *
-import numpy as np
+import math
+from collections import deque
 
+import numpy as np
 import torch
-from torch._six import inf
+
+inf = math.inf
 
 # if default_config['TrainMethod'] in ['PPO', 'ICM', 'RND']:
 #     num_step = int(ppo_config['NumStep'])
@@ -92,6 +95,215 @@ def softmax(z):
     div = np.sum(e_x, axis=1)
     div = div[:, np.newaxis]  # dito
     return e_x / div
+
+
+class AnchorBuffer:
+    """Reservoir-sampled buffer of (feature, discovery_step) pairs for DSC.
+
+    Anchors are inserted when a state's intrinsic reward exceeds the running
+    `percentile`-th percentile of recent intrinsic rewards. Reservoir sampling
+    keeps a uniform sample of all candidates over time, so older anchors are
+    not strictly forgotten but get more diluted as more candidates appear.
+
+    Distances are tracked in feature space (L2). Lookup is O(N) brute-force
+    which is fine for N<=64 on M1 Pro. A running mean of nearest-anchor
+    distances is exposed for callers that want to normalize a distance-based
+    bonus to be scale-invariant.
+    """
+
+    def __init__(self, capacity=64, feature_dim=512, percentile=0.9,
+                 reward_window=2000, rank_beta=0.5,
+                 num_clusters=0):
+        self.capacity = capacity
+        self.feature_dim = feature_dim
+        self.percentile = percentile
+        self.rank_beta = rank_beta
+        self.features = np.zeros((capacity, feature_dim), dtype=np.float32)
+        self.discovery_step = np.zeros(capacity, dtype=np.int64)
+        self.filled = 0
+        self._candidates_seen = 0
+        self._reward_buffer = deque(maxlen=reward_window)
+        # EMA of mean nearest-anchor distance; used by callers to normalize
+        # distance-based DSC bonuses.
+        self.dist_ema = None
+
+        # Cluster-based "types" (DSC type-learning extension).
+        # num_clusters=0 means clustering is disabled and nearest_cluster()
+        # behaves like nearest(). When >0, recluster() periodically runs
+        # K-means over the filled anchors; nearest_cluster() returns the
+        # nearest cluster center, the distance to it, and a rank_weight
+        # derived from the mean discovery_step of cluster members.
+        self.num_clusters = num_clusters
+        self.cluster_centers = (np.zeros((num_clusters, feature_dim), dtype=np.float32)
+                                if num_clusters > 0 else None)
+        self.cluster_mean_age = (np.zeros(num_clusters, dtype=np.float64)
+                                 if num_clusters > 0 else None)
+        self.cluster_member_count = (np.zeros(num_clusters, dtype=np.int64)
+                                     if num_clusters > 0 else None)
+        self.cluster_filled = 0  # how many cluster centers are valid
+
+    def maybe_insert(self, feature, intrinsic_reward, global_step):
+        """Consider a new feature for insertion based on intrinsic reward percentile.
+
+        Returns True if inserted.
+        """
+        self._reward_buffer.append(float(intrinsic_reward))
+        if len(self._reward_buffer) < 50:
+            return False
+        threshold = np.percentile(list(self._reward_buffer), 100 * self.percentile)
+        if intrinsic_reward < threshold:
+            return False
+        self._candidates_seen += 1
+        if self.filled < self.capacity:
+            idx = self.filled
+            self.features[idx] = feature
+            self.discovery_step[idx] = global_step
+            self.filled += 1
+            return True
+        # Reservoir sampling: replace with probability capacity / candidates_seen
+        idx = np.random.randint(0, self._candidates_seen)
+        if idx < self.capacity:
+            self.features[idx] = feature
+            self.discovery_step[idx] = global_step
+            return True
+        return False
+
+    def nearest(self, features):
+        """Vectorized nearest-anchor lookup.
+
+        features: [B, D] numpy array.
+        Returns (nearest_idx [B], dists [B], rank_weights [B]).
+        If buffer is empty, all return zeros / index 0 / rank_weight 1.0.
+        """
+        B = features.shape[0]
+        if self.filled == 0:
+            return (np.zeros(B, dtype=np.int64),
+                    np.zeros(B, dtype=np.float32),
+                    np.ones(B, dtype=np.float32))
+        diff = features[:, None, :] - self.features[None, :self.filled, :]
+        dists = np.sqrt((diff ** 2).sum(axis=2))  # [B, filled]
+        nearest_idx = np.argmin(dists, axis=1)
+        nearest_dists = dists[np.arange(B), nearest_idx]
+        # Update running mean of distances (used for normalization elsewhere).
+        batch_mean = float(nearest_dists.mean())
+        if self.dist_ema is None:
+            self.dist_ema = max(batch_mean, 1e-6)
+        else:
+            self.dist_ema = 0.99 * self.dist_ema + 0.01 * batch_mean
+        # rank_weight uses *relative* anchor age within the buffer:
+        # newest anchor -> largest weight; oldest -> smallest weight.
+        if self.filled > 1:
+            ages = self.discovery_step[:self.filled]
+            max_age = ages.max()
+            min_age = ages.min()
+            span = max(1, max_age - min_age)
+            # normalized age in [0, 1]; newer = larger
+            norm_age = (ages[nearest_idx] - min_age) / span
+            # rank_weight emphasises newer anchors; β controls steepness
+            rank_weights = (norm_age + 0.1) ** self.rank_beta
+        else:
+            rank_weights = np.ones(B, dtype=np.float32)
+        return nearest_idx, nearest_dists.astype(np.float32), rank_weights.astype(np.float32)
+
+
+def _kmeans(X, K, n_iters=20, seed=0):
+    """Brute-force K-means for small data. Returns (centers, assignments).
+
+    X: [N, D] feature matrix.
+    K: number of clusters.
+    n_iters: max Lloyd's algorithm iterations.
+    """
+    rng = np.random.RandomState(seed)
+    N, D = X.shape
+    K = min(K, N)
+    if K == 0:
+        return np.zeros((0, D), dtype=X.dtype), np.zeros(N, dtype=np.int64)
+    centers = X[rng.choice(N, size=K, replace=False)].copy()
+    assignments = np.zeros(N, dtype=np.int64)
+    for _ in range(n_iters):
+        # Assign each point to nearest center
+        diff = X[:, None, :] - centers[None, :, :]
+        dists = (diff * diff).sum(axis=2)
+        new_assignments = np.argmin(dists, axis=1)
+        # Update centers
+        new_centers = centers.copy()
+        for k in range(K):
+            mask = (new_assignments == k)
+            if mask.any():
+                new_centers[k] = X[mask].mean(axis=0)
+        if np.array_equal(new_assignments, assignments) and np.allclose(centers, new_centers, atol=1e-4):
+            assignments = new_assignments
+            centers = new_centers
+            break
+        assignments = new_assignments
+        centers = new_centers
+    return centers, assignments
+
+
+def _patch_anchor_buffer_with_clusters():
+    """Attach recluster() and nearest_cluster() methods to AnchorBuffer.
+
+    Done as a post-hoc patch so the class definition above stays focused on
+    the core buffer mechanics, and the clustering extension can be removed
+    cleanly by deleting this patch block.
+    """
+
+    def recluster(self):
+        """Recompute K-means cluster centers and per-cluster mean discovery age.
+
+        No-op if clustering is disabled (num_clusters=0) or no anchors yet.
+        """
+        if self.num_clusters == 0 or self.filled == 0:
+            return
+        K = min(self.num_clusters, self.filled)
+        centers, assignments = _kmeans(self.features[:self.filled], K)
+        self.cluster_centers[:K] = centers
+        self.cluster_filled = K
+        for k in range(K):
+            mask = (assignments == k)
+            if mask.any():
+                self.cluster_mean_age[k] = float(self.discovery_step[:self.filled][mask].mean())
+                self.cluster_member_count[k] = int(mask.sum())
+            else:
+                self.cluster_mean_age[k] = 0.0
+                self.cluster_member_count[k] = 0
+
+    def nearest_cluster(self, features):
+        """Cluster-based nearest lookup. Returns (cluster_idx, dists, rank_weights).
+
+        Falls back to anchor-based nearest() if clustering is disabled or
+        no cluster centers are populated yet.
+        """
+        if self.num_clusters == 0 or self.cluster_filled == 0:
+            return self.nearest(features)
+        B = features.shape[0]
+        diff = features[:, None, :] - self.cluster_centers[None, :self.cluster_filled, :]
+        dists = np.sqrt((diff ** 2).sum(axis=2))  # [B, cluster_filled]
+        nearest_idx = np.argmin(dists, axis=1)
+        nearest_dists = dists[np.arange(B), nearest_idx]
+        # Update running mean of distances (parallel to the anchor case).
+        batch_mean = float(nearest_dists.mean())
+        if self.dist_ema is None:
+            self.dist_ema = max(batch_mean, 1e-6)
+        else:
+            self.dist_ema = 0.99 * self.dist_ema + 0.01 * batch_mean
+        # rank_weight based on cluster mean age — newer clusters higher weight
+        if self.cluster_filled > 1:
+            ages = self.cluster_mean_age[:self.cluster_filled]
+            max_age = ages.max()
+            min_age = ages.min()
+            span = max(1.0, max_age - min_age)
+            norm_age = (ages[nearest_idx] - min_age) / span
+            rank_weights = (norm_age + 0.1) ** self.rank_beta
+        else:
+            rank_weights = np.ones(B, dtype=np.float32)
+        return nearest_idx, nearest_dists.astype(np.float32), rank_weights.astype(np.float32)
+
+    AnchorBuffer.recluster = recluster
+    AnchorBuffer.nearest_cluster = nearest_cluster
+
+
+_patch_anchor_buffer_with_clusters()
 
 
 def global_grad_norm_(parameters, norm_type=2):
