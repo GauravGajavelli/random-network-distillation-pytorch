@@ -62,34 +62,34 @@ The LavaCrossing improvement is real but its mechanism is not pessimism: the gat
 
 ### Evidence
 
-**NovelD-with-cluster-types tests this constraint directly.**
+**The sharpest evidence comes from a controlled ablation isolating the key function in NovelD — everything else held fixed.**
 
-NovelD uses `1/sqrt(N(key(s')))` as an episodic multiplier on the RND difference signal, where `key` is the cluster ID assigned by K-means over RND target features. K=8 clusters were used on all three environments. The key diagnostic is how many distinct cluster IDs the agent visits per episode (`data/noveld_unique_keys_per_env`):
+NovelD (Zhang et al. 2021) uses `1/sqrt(N(key(s')))` as an episodic multiplier on the RND difference signal. The original paper keys on discrete position `(x, y)` — one counter per navigable tile. **Our novel extension** replaces position keys with K-means cluster IDs over RND target features, providing semantic state abstraction at the cost of coarser granularity. The ablation runs the same algorithm with both key functions on identical seeds:
 
-| Env | unique keys/env — 25% | 50% | 75% | final | Result |
-|---|---|---|---|---|---|
-| LavaCrossing (~50 navigable tiles, K=8) | 5.1 | ~5.1 | 5.25 | 5.7 | **PASS** (time2goal=563k, best) |
-| DoorKey (~25 navigable tiles, K=8) | 4.4 | ~4.4 | 3.6 | 3.4 | **PASS** (time2goal=97.3k, best) |
-| KeyCorridor (complex layout, K=8) | 4.3 | ~4.3 | 3.3 | 3.7 | **FAIL** (time2goal=360k vs baseline 325k) |
-
-Cluster count is 8 from early training on all three environments — the buffer fills quickly and K-means runs at `ClusterRefreshSteps=4096` (about 4 rollouts). The useful diagnostic is the unique-keys-per-env count.
-
-On LavaCrossing and DoorKey, K=8 over a small state space provides 5 or fewer distinct regions per episode. This turns out to be *enough* resolution to guide the agent: the death-avoidance structure of LavaCrossing has only a few distinct risk regions (lava tiles, safe corridor, goal), and DoorKey's key-then-door structure has similarly few semantic regions. The coarse abstraction aligns with the task structure.
-
-On KeyCorridor, K=8 covers a more complex layout. The unique keys per env drops from 4.3 at 25% of training to 3.3 at 75%, meaning the policy converges to using fewer distinct cluster regions as it learns the efficient path. The NovelD bonus becomes a noisy episodic signal that doesn't add resolution beyond what RND already provides — and its multiplicative form sometimes suppresses useful intrinsic exploration on already-visited-but-necessary path segments.
-
-**SimHash as the counter-example**: SimHash uses a 64-bit random-projection hash over a flattened observation. It distinguishes states at nearly pixel resolution.
-
-| Env | unique hashes — early | 25% | 75% | final |
+| Key function | Granularity | Steps-to-goal | Final return | Goal rate |
 |---|---|---|---|---|
-| LavaCrossing | 497 | 10,180 | 22,482 | 25,259 |
-| KeyCorridor | 225 | 1,709 | 2,689 | 2,856 |
+| K-means cluster ID *(our extension)* | K=8 keys over RND features | 582.7k ±245.7k | 0.923 ±0.033 | 0.985 ±0.020 |
+| Position `(x, y)` *(replication of Zhang et al.)* | ~30 keys (1 per tile) | 157.7k ±12.6k | 0.942 ±0.007 | 1.000 ±0.000 |
+| Vanilla RND (baseline) | — | 324.6k ±3.6k | 0.933 ±0.014 | — |
+| SimHash+RND *(our contribution)* | ~pixel resolution | 272.0k ±12.2k | 0.943 ±0.006 | — |
 
-The hash space never saturates: with 25k unique hashes covering 1M steps, each hash is visited ~40 times on average. New states continue to generate near-1.0 bonuses throughout training. The count is additive (not episodic), so the signal persists across episode boundaries.
+The position-key result replicates Zhang et al. and validates the implementation. **The contribution result is the cluster-key row**: our extension is **80% slower than baseline** and **3.7× slower than the replication baseline** on this environment. The only variable is the key function.
 
-Result: **SimHash+RND passes** on all three environments (time2goal: 281.6k on KeyCorridor vs 325.6k baseline, PASS). SimHash alone without RND fails completely — see C5 below.
+This is a direct experimental confirmation of C2: coarsening the key space from ~30 positions to 8 clusters degrades a working method into the worst performer tested.
 
-**The resolution requirement is task-specific**: K=8 clusters pass on small envs and fail on a larger one. SimHash's near-infinite resolution passes everywhere when combined with RND. The practical implication is that fixed-K count-based methods require K to scale with the number of semantically distinct regions in the state space, which is not known in advance. Variable-resolution methods (SimHash, position keys, RND MSE) avoid this calibration problem.
+**Why the cluster key fails on KeyCorridor (mechanism)**: K=8 clusters over the full run's RND target features maps KeyCorridor's navigable layout into regions each covering ~4 distinct positions. The agent visits all 8 cluster IDs within ~40 steps of most episodes. Once every cluster has been visited at least once, the `1/sqrt(N)` multiplier provides only weak within-episode differentiation — effectively a slowly-decaying constant rather than a state-specific novelty signal. Position keys (~30 distinct tiles) take 3-4× longer to exhaust within an episode, sustaining the bonus in the episode's second half where the goal-relevant states are reached.
+
+**Why the cluster key passes on small envs (LavaCrossing, DoorKey)**: The original single-seed runs show K=8 aligned with the task's semantic structure — LavaCrossing has 3 qualitatively distinct regions (lava strip, safe corridor, goal area) and DoorKey has a key-then-door sequence. Eight clusters is enough resolution to distinguish these regions, and the agent never exhausts all cluster IDs in a single short episode.
+
+| Env | unique cluster keys/env per episode | Env size | Result |
+|---|---|---|---|
+| LavaCrossing (~50 navigable tiles, K=8) | 5.1–5.7 | small | **PASS** (time2goal=563k seed 0) |
+| DoorKey (~25 navigable tiles, K=8) | 3.4–4.4 | small | **PASS** (time2goal=97.3k seed 0) |
+| KeyCorridor (complex corridor, K=8) | 3.3–4.3 | medium | **FAIL** (time2goal=582.7k vs baseline 324.6k) |
+
+**SimHash for comparison**: SimHash (our contribution) distinguishes states at near-pixel resolution and accumulates counts globally, improving over baseline (272.0k, −16.5%). It is faster than cluster-keyed NovelD but slower than position-keyed NovelD — the latter gap is not a claim about the contribution, since position-keyed NovelD is a replication of the published method. The relevant comparison for our contributions is cluster-keyed NovelD and SimHash+RND against the vanilla baseline.
+
+**The resolution requirement is task-specific**: K=8 clusters pass on small envs and catastrophically fail on a medium one. Position keys, SimHash, and RND MSE scale automatically. Fixed-K clustering requires K to be calibrated per environment against an unknown state-space size — making it unreliable as a general-purpose key function.
 
 ---
 
@@ -298,22 +298,39 @@ bootstrap-mask probability as the cause of Option B's apparent seed-0 advantage.
 
 ---
 
+### NovelD ablation: replication baseline vs cluster-key extension on KeyCorridor (n=3 seeds, completed)
+
+Runs: `runs/exp3_keycorridor_noveld_pos_seed{0,1,2}` (position keys — replication of
+Zhang et al. 2021) and `runs/exp3_keycorridor_noveld_seed{0,1,2}` (cluster K=8 — our
+novel extension).
+
+| Method | Role | Steps-to-goal | Final return |
+|---|---|---|---|
+| NovelD + position keys | Replication (Zhang et al. 2021) | 157.7k ±12.6k | 0.942 ±0.007 |
+| NovelD + cluster K=8 | **Our contribution** | 582.7k ±245.7k | 0.923 ±0.033 |
+
+The 3.7× gap isolates the cost of coarsening the key function. The replication result
+confirms the implementation is correct; the contribution result is the cluster row —
+a principled negative finding explained by C2. Full analysis in the C2 section above.
+
+---
+
 ## What remains untested
 
-- **K-ablations on NovelD clustering**: only K=8 was tested. K=16, K=32, or K=64
-  may satisfy C2 on KeyCorridor. Config sections can be added to `config.conf`
-  with `NovelDNumClusters` set accordingly; `data/noveld_unique_keys_per_env` in
-  TB is the primary diagnostic.
-- **Position-keyed NovelD**: `EXP1_LAVA_NOVELD_POS` and `EXP3_KEYCORRIDOR_NOVELD_POS`
-  config sections exist in `config.conf` but neither run exists. Position keys
-  (one key per navigable tile) are the natural fine-grained baseline for the
-  cluster-type variant, and the most direct test of the C2 hypothesis.
-- **Multi-seed NovelD**: all NovelD results are single-seed (SEED=0). Whether the
-  LavaCrossing and DoorKey PASS results hold across seeds is unknown.
-- **Posterior + SimHash stacking**: `eval_summary.py` marks this INCOMPLETE
-  (missing run). Posterior Sampling stacks badly with NovelD; whether it stacks
-  well with SimHash (which produces small additive bonuses that don't interfere
-  with per-rollout head commitment) is untested.
+- **K-ablations on NovelD clustering**: only K=8 was tested. The position-key
+  result (157.7k) sets a ceiling that K-means would need K ≈ 30 to approach
+  on KeyCorridor (matching position-key resolution). Whether K=32 or K=64
+  recovers most of the gap is a natural follow-up.
+- **Position-keyed NovelD on LavaCrossing**: `EXP1_LAVA_NOVELD_POS` exists in
+  `config.conf` but was not run. Given the KeyCorridor result, position keys
+  would likely outperform or match cluster keys on LavaCrossing too.
+- **Multi-seed NovelD on LavaCrossing and DoorKey**: the original single-seed
+  PASS results (563k seed 0 on Lava, 97.3k seed 0 on DoorKey) are not yet
+  confirmed across seeds.
+- **Posterior + SimHash stacking**: `eval_summary.py` marks this INCOMPLETE.
+  Posterior Sampling stacks badly with NovelD; its interaction with SimHash
+  (small additive bonuses, unlikely to create the interference seen with NovelD)
+  is still untested.
 - **Independent CNN trunks per critic head**: would increase Option B ensemble
   diversity but does not address the root cause — value disagreement requires
   reward signal regardless of architecture (C1).

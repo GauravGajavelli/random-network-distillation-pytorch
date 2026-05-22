@@ -9,11 +9,11 @@ Four exploration enhancements to Random Network Distillation (Burda et al. 2018)
 | Enhancement | Description | Outcome |
 |---|---|---|
 | **Option B** | K=5 ensemble extrinsic critics + variance-gated intrinsic reward | Wins on Pitfall proxy; fails on Gravitar proxy — mechanism validated, not universally better |
-| **NovelD + cluster types** | Episodic count bonus on K-means cluster IDs over RND target features | Best on small envs (Lava, DoorKey); adds noise on KeyCorridor where vanilla RND already works |
+| **NovelD + cluster types** | Episodic count bonus on K-means cluster IDs (K=8) over RND target features — our extension; position-keyed variant is replication of Zhang et al. 2021 | Cluster-keyed: 582.7k ±245.7k on KeyCorridor (n=3 seeds) vs vanilla 320.5k — C2 failure (K=8 too coarse); position-keyed: 157.7k ±12.6k (n=3 seeds) — confirms implementation; wins on small envs (Lava, DoorKey) |
 | **SimHash + RND** | Additive random-projection pseudo-count on top of RND intrinsic signal | **16.5% faster convergence** on KeyCorridor (n=3 seeds, consistent across seeds) |
 | **Posterior Sampling** | Per-rollout head sampling on K-critic ensemble for trajectory-level exploration | Useful alone; catastrophic when stacked with NovelD |
 
-**Key finding**: SimHash+RND converges to goal in 267.6k ± 12.7k steps vs vanilla RND's 320.5k ± 3.6k (n=3 matched seeds, `MiniGrid-KeyCorridorS3R1-v0`). A three-seed ablation (SimHash-only, `UseRNDBonus=False`) shows the hash bonus alone completely fails — 0.000 extrinsic return at 1.5M steps despite 1.2M unique hash observations — establishing that RND provides the essential directional signal and SimHash provides complementary coverage.
+**Key finding**: SimHash+RND converges to goal in 267.6k ± 12.7k steps vs vanilla RND's 320.5k ± 3.6k (n=3 matched seeds, `MiniGrid-KeyCorridorS3R1-v0`). A three-seed ablation (SimHash-only, `UseRNDBonus=False`) shows the hash bonus alone completely fails — 0.000 extrinsic return at 1.5M steps despite 1,386,233 ±30,884 unique hash observations — establishing that RND provides the essential directional signal and SimHash provides complementary coverage.
 
 A structural constraint analysis deriving five properties (C1–C5) any RND enhancement must satisfy is in [`reports/rnd_enhancement_constraints.md`](reports/rnd_enhancement_constraints.md).
 
@@ -79,7 +79,9 @@ runs/                        # TensorBoard event logs for all experiments
     exp3_keycorridor_baseline*          # Vanilla RND (3 seeds)
     exp3_keycorridor_simhash*           # SimHash+RND (3 seeds)  ← key result
     exp3_keycorridor_simhash_only_seed* # SimHash-only ablation (3 seeds)
-    exp3_keycorridor_noveld*            # NovelD variants
+    exp3_keycorridor_noveld_seed*       # NovelD cluster-keyed K=8 (our extension, 3 seeds)
+    exp3_keycorridor_noveld_pos_seed*   # NovelD position-keyed (replication, 3 seeds)
+    exp3_keycorridor_noveld*            # NovelD single-seed runs (Lava, DoorKey)
     exp3_keycorridor_simhash_tv*        # SimHash + noisy TV diagnostic
   exp4_keycorridor_*/        # Exp 4: Posterior sampling
   runs_1/                    # Archive: DSC experiment logs (earlier sweep)
