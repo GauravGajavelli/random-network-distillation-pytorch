@@ -229,6 +229,42 @@ def encode_carrying(carrying):
     return vec
 
 
+class LavaDeathPenaltyWrapper(gym.Wrapper):
+    """Add a negative reward on lava-death termination.
+
+    Default MiniGrid LavaCrossing terminates with reward=0 on lava contact,
+    which is structurally identical to a timeout — no aversive signal.
+    This wrapper applies a configurable negative reward on any termination
+    that wasn't a positive-reward goal-reach, making lava death an actual
+    negative extrinsic event.
+
+    This converts MiniGrid LavaCrossing into a true Pitfall analog where
+    intrinsic curiosity (positive) competes against extrinsic penalty
+    (negative) at lava-adjacent states — the exact mechanism that Option B's
+    pessimistic ensemble amplifies.
+
+    Apply before any goal/death classification that depends on the reward sign;
+    the classification logic in MiniGridEnvironment (terminated + reward <= 0
+    = death) continues to work because the penalty just makes the reward
+    more negative.
+    """
+
+    def __init__(self, env, penalty=-1.0):
+        super().__init__(env)
+        self.penalty = float(penalty)
+
+    def step(self, action):
+        obs, r, terminated, truncated, info = self.env.step(action)
+        # Lava-death detection: episode terminated (not truncated) AND no goal
+        # reward was given. Reward at the goal is positive (1 - 0.9 * step/max).
+        if terminated and r <= 0:
+            r = self.penalty
+        return obs, r, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+
 class NoisyTVWrapper(gym.Wrapper):
     """Moving variable-size random pixel patch overlaid on the RGB observation.
 
@@ -284,19 +320,26 @@ class MiniGridEnvironment(Environment):
                  history_size=4, h=84, w=84, life_done=False,
                  sticky_action=False, p=0.0,
                  tv_on=False, tv_max_size=9, p_move=1.0,
-                 use_inventory=False, tile_size=8, **kwargs):
+                 use_inventory=False, tile_size=8, seed=0,
+                 lava_penalty=0.0, **kwargs):
         super().__init__()
         self.daemon = True
 
         import minigrid  # noqa: F401  (registers envs)
         from minigrid.wrappers import RGBImgPartialObsWrapper, ImgObsWrapper
 
+        # Per-worker seed: deterministic but distinct across workers.
+        self._seed = int(seed) * 1000 + int(env_idx)
         base = gym.make(env_id)
+        # Apply lava-death penalty BEFORE the pixel wrappers so the reward
+        # transformation sees the unmodified terminated/reward signals.
+        if lava_penalty != 0.0:
+            base = LavaDeathPenaltyWrapper(base, penalty=lava_penalty)
         base = RGBImgPartialObsWrapper(base, tile_size=tile_size)
         base = ImgObsWrapper(base)
         if tv_on:
             base = NoisyTVWrapper(base, tv_on=True, tv_max_size=tv_max_size,
-                                  p_move=p_move, seed=env_idx)
+                                  p_move=p_move, seed=self._seed)
         self.env = base
         self.env_id = env_id
         self.env_idx = env_idx
@@ -350,10 +393,18 @@ class MiniGridEnvironment(Environment):
             self.rall += reward
             self.steps += 1
 
+            # Expose the agent's discrete pose for NovelD position-based
+            # episodic counting. Read post-step (i.e., pose after the action).
+            unwrapped = self.env.unwrapped
+            pos = getattr(unwrapped, 'agent_pos', None)
+            agent_dir = int(getattr(unwrapped, 'agent_dir', 0))
+            pos_key = (int(pos[0]), int(pos[1]), agent_dir) if pos is not None else (0, 0, 0)
+
             extras = {
                 'inventory_vec': self.inventory_vec.copy(),
                 'died': self.died if done else False,
                 'reached_goal': self.reached_goal if done else False,
+                'pos_key': pos_key,
             }
 
             if done:
@@ -377,7 +428,9 @@ class MiniGridEnvironment(Environment):
         self.rall = 0.0
         self.died = False
         self.reached_goal = False
-        s, _info = self.env.reset()
+        # Deterministic env reset using a sequence of seeds derived from the
+        # per-worker seed. Each episode advances the seed by 1.
+        s, _info = self.env.reset(seed=self._seed + self.episode)
         if self.use_inventory:
             self.inventory_vec = encode_carrying(self.env.unwrapped.carrying)
         else:

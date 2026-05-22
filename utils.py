@@ -206,6 +206,116 @@ class AnchorBuffer:
         return nearest_idx, nearest_dists.astype(np.float32), rank_weights.astype(np.float32)
 
 
+class EpisodicCountCounter:
+    """Per-episode visit counter used by NovelD's multiplier.
+
+    Keys can be any hashable (position tuples, cluster IDs, ...). The
+    multiplier returns 1/sqrt(N) where N is the number of visits to the
+    key in the current episode. Reset clears all counts.
+    """
+
+    def __init__(self):
+        self._counts = {}
+
+    def visit_and_multiplier(self, key):
+        """Increment count for key, return 1/sqrt(post-increment count)."""
+        self._counts[key] = self._counts.get(key, 0) + 1
+        return 1.0 / math.sqrt(self._counts[key])
+
+    def reset(self):
+        self._counts.clear()
+
+    def unique_count(self):
+        return len(self._counts)
+
+
+class FeatureClusterer:
+    """Online K-means clusterer for the NovelD-with-cluster-types variant.
+
+    Maintains a reservoir-sampled buffer of feature vectors (filled
+    unconditionally, distinct from DSC's percentile-thresholded
+    AnchorBuffer). Periodically reclusters to produce K centroid IDs that
+    the EpisodicCountCounter keys off of.
+    """
+
+    def __init__(self, buffer_size=256, feature_dim=512, num_clusters=8, seed=0):
+        self.buffer_size = buffer_size
+        self.feature_dim = feature_dim
+        self.num_clusters = num_clusters
+        self.features = np.zeros((buffer_size, feature_dim), dtype=np.float32)
+        self.filled = 0
+        self._candidates_seen = 0
+        self._rng = np.random.RandomState(seed)
+
+        self.cluster_centers = np.zeros((num_clusters, feature_dim), dtype=np.float32)
+        self.cluster_filled = 0
+
+    def add(self, feature):
+        """Reservoir-sample one feature into the buffer."""
+        self._candidates_seen += 1
+        if self.filled < self.buffer_size:
+            self.features[self.filled] = feature
+            self.filled += 1
+            return
+        idx = self._rng.randint(0, self._candidates_seen)
+        if idx < self.buffer_size:
+            self.features[idx] = feature
+
+    def add_batch(self, features):
+        for f in features:
+            self.add(f)
+
+    def recluster(self):
+        if self.filled == 0:
+            return
+        K = min(self.num_clusters, self.filled)
+        centers, _assign = _kmeans(self.features[:self.filled], K,
+                                    seed=int(self._rng.randint(1 << 30)))
+        self.cluster_centers[:K] = centers
+        self.cluster_filled = K
+
+    def cluster_id(self, feature):
+        """Return nearest cluster ID for a query feature.
+
+        Returns -1 if no clusters exist yet (caller should fall back to a
+        default key like '__no_cluster__').
+        """
+        if self.cluster_filled == 0:
+            return -1
+        diff = self.cluster_centers[:self.cluster_filled] - feature[None, :]
+        return int(np.argmin((diff * diff).sum(axis=1)))
+
+
+class SimHashCounter:
+    """Random-projection-based pseudo-count for SimHash exploration.
+
+    Projects an observation through a fixed random matrix, takes the sign
+    to get a binary hash, and counts occurrences. Bonus is 1/sqrt(count).
+    Per-counter (not per-episode) so it provides a quasi-episodic novelty
+    signal that persists across the run.
+    """
+
+    def __init__(self, obs_dim, hash_dim=64, seed=0):
+        rng = np.random.RandomState(seed)
+        # Random projection matrix; fixed for the lifetime of the counter.
+        self.proj = rng.randn(obs_dim, hash_dim).astype(np.float32)
+        self._counts = {}
+
+    def _hash(self, obs_flat):
+        """Convert a flat observation vector into a hashable bytes key."""
+        proj = obs_flat @ self.proj
+        bits = (proj > 0).astype(np.uint8)
+        return bits.tobytes()
+
+    def visit_and_bonus(self, obs_flat):
+        key = self._hash(obs_flat)
+        self._counts[key] = self._counts.get(key, 0) + 1
+        return 1.0 / math.sqrt(self._counts[key])
+
+    def unique_count(self):
+        return len(self._counts)
+
+
 def _kmeans(X, K, n_iters=20, seed=0):
     """Brute-force K-means for small data. Returns (centers, assignments).
 

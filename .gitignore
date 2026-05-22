@@ -34,3 +34,5 @@ lib/
 .idea
 *.iml
 /.venv
+/runs_1
+/models_1

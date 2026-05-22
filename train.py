@@ -11,7 +11,9 @@ If no run_name is given, the section name is used. TensorBoard logs go to
 Supports MiniGrid (gymnasium) and Atari (gymnasium + ale-py) env types. Mario
 is currently stubbed.
 """
+import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -26,7 +28,8 @@ from agents import RNDAgent
 from config import default_config, default_section
 from envs import (AtariEnvironment, MarioEnvironment, MiniGridEnvironment,
                   INVENTORY_DIM)
-from utils import (AnchorBuffer, RewardForwardFilter, RunningMeanStd,
+from utils import (AnchorBuffer, EpisodicCountCounter, FeatureClusterer,
+                   RewardForwardFilter, RunningMeanStd, SimHashCounter,
                    make_train_data, softmax)
 
 
@@ -34,6 +37,15 @@ def main():
     print({k: v for k, v in default_config.items()})
     run_name = sys.argv[1] if len(sys.argv) > 1 else default_section
     print(f"run_name={run_name}")
+
+    # Seed for reproducibility. SEED env var takes precedence over config.
+    seed = int(os.environ.get('SEED', default_config.get('Seed', '0')))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    print(f"seed={seed}")
 
     env_id = default_config['EnvID']
     env_type = default_config['EnvType']
@@ -71,6 +83,7 @@ def main():
     num_ext_critics = int(default_config['NumExtCritics']) if use_option_b else 1
     bootstrap_p = float(default_config['BootstrapP'])
     gate_alpha = float(default_config['GateAlpha'])
+    gate_floor = float(default_config.get('GateFloor', '0.2'))
 
     # DSC
     use_dsc = default_config.getboolean('UseDSC', fallback=False)
@@ -83,12 +96,34 @@ def main():
     num_clusters = int(default_config['NumClusters']) if use_clusters else 0
     cluster_refresh_steps = int(default_config['ClusterRefreshSteps'])
 
+    # NovelD (difference form + episodic visit-count multiplier)
+    use_noveld = default_config.getboolean('UseNovelD', fallback=False)
+    noveld_alpha = float(default_config.get('NovelDAlpha', '0.5'))
+    use_noveld_clusters = default_config.getboolean('UseNovelDClusters', fallback=False)
+    noveld_num_clusters = int(default_config.get('NovelDNumClusters', '8'))
+    noveld_buffer_size = int(default_config.get('NovelDBufferSize', '256'))
+
+    # SimHash additive bonus
+    use_simhash = default_config.getboolean('UseSimHash', fallback=False)
+    simhash_lambda = float(default_config.get('SimHashLambda', '0.5'))
+    simhash_dim = int(default_config.get('SimHashDim', '64'))
+
+    # Posterior sampling. Uses NumExtCritics critics; per-env active head
+    # is resampled at the start of each rollout. Mutually exclusive with
+    # Option B (both interpret the K critics differently).
+    use_posterior_sampling = default_config.getboolean('UsePosteriorSampling', fallback=False)
+    if use_posterior_sampling:
+        num_ext_critics = int(default_config['NumExtCritics'])
+        if use_option_b:
+            raise ValueError("UsePosteriorSampling and UseOptionB are mutually exclusive")
+
     # MiniGrid wrapper options
     tv_on = default_config.getboolean('TVOn', fallback=False)
     tv_max_size = int(default_config['TVMaxSize'])
     p_move = float(default_config['PMove'])
     use_inventory = default_config.getboolean('UseInventory', fallback=False)
     tile_size = int(default_config['TileSize'])
+    lava_penalty = float(default_config.get('LavaPenalty', '0.0'))
     inventory_dim = INVENTORY_DIM if use_inventory else 0
 
     # Logging / output paths
@@ -101,6 +136,13 @@ def main():
     target_path = models_dir / f'{run_name}.target'
 
     writer = SummaryWriter(log_dir=str(log_dir))
+
+    # Dump full config + seed to log dir for rubric reproducibility.
+    config_dump = {k: v for k, v in default_config.items()}
+    config_dump['_run_name'] = run_name
+    config_dump['_seed'] = seed
+    config_dump['_config_section'] = default_section
+    (log_dir / 'config.json').write_text(json.dumps(config_dump, indent=2))
 
     # Pick env class
     if env_type == 'atari':
@@ -140,8 +182,9 @@ def main():
         ppo_eps=ppo_eps, use_cuda=use_cuda, use_gae=use_gae,
         use_noisy_net=use_noisy_net,
         use_option_b=use_option_b, num_ext_critics=num_ext_critics,
-        bootstrap_p=bootstrap_p, gate_alpha=gate_alpha,
+        bootstrap_p=bootstrap_p, gate_alpha=gate_alpha, gate_floor=gate_floor,
         use_dsc=use_dsc, num_anchors=num_anchors, dsc_lambda=dsc_lambda,
+        use_noveld=use_noveld, noveld_alpha=noveld_alpha,
         inventory_dim=inventory_dim,
     )
 
@@ -159,6 +202,22 @@ def main():
         num_clusters=num_clusters) if use_dsc else None
     steps_since_recluster = 0
 
+    # NovelD per-env episodic visit counters. Reset on real_done.
+    noveld_counters = [EpisodicCountCounter() for _ in range(num_worker)] if use_noveld else None
+    # Optional cluster mode: shared FeatureClusterer + per-env counter keys
+    # off cluster IDs instead of position tuples.
+    noveld_clusterer = (FeatureClusterer(
+        buffer_size=noveld_buffer_size, feature_dim=512,
+        num_clusters=noveld_num_clusters, seed=seed)
+        if (use_noveld and use_noveld_clusters) else None)
+    steps_since_noveld_recluster = 0
+
+    # SimHash counter (shared across all envs; key is a deterministic hash so
+    # this is per-run, not per-episode). Initialised lazily after we know the
+    # obs shape.
+    simhash_counter = None
+    simhash_obs_dim = 84 * 84  # single-channel flattened
+
     # Running normalization
     reward_rms = RunningMeanStd()
     obs_rms = RunningMeanStd(shape=(1, 1, 84, 84))
@@ -166,7 +225,8 @@ def main():
 
     # Spawn workers
     minigrid_kwargs = dict(tv_on=tv_on, tv_max_size=tv_max_size, p_move=p_move,
-                            use_inventory=use_inventory, tile_size=tile_size)
+                            use_inventory=use_inventory, tile_size=tile_size,
+                            seed=seed, lava_penalty=lava_penalty)
     works = []
     parent_conns = []
     for idx in range(num_worker):
@@ -182,6 +242,28 @@ def main():
     K = num_ext_critics
     states = np.zeros([num_worker, 4, 84, 84])
     inventories = np.zeros([num_worker, inventory_dim], dtype=np.float32) if inventory_dim > 0 else None
+    # Previous-step normalized obs, used by NovelD's difference form. Initialized
+    # to zeros so the first NovelD step gets max(rnd_next - alpha * rnd(zeros), 0)
+    # which is close to rnd_next when rnd(zeros) is small.
+    prev_norm_next_obs = np.zeros([num_worker, 1, 84, 84], dtype=np.float32)
+    prev_next_inventories = (np.zeros([num_worker, inventory_dim], dtype=np.float32)
+                              if (use_noveld and inventory_dim > 0) else None)
+
+    if use_simhash:
+        simhash_counter = SimHashCounter(obs_dim=simhash_obs_dim,
+                                          hash_dim=simhash_dim, seed=seed)
+
+    # Posterior-sampling per-env active head (one of NumExtCritics).
+    # Resampled at the END of each rollout (which approximates per-episode
+    # resampling, since episodes often span/finish within a rollout).
+    active_heads = (np.random.randint(0, num_ext_critics, size=num_worker)
+                    if use_posterior_sampling else None)
+
+    # Global state-coverage tracking: union of (pos_x, pos_y, dir) keys
+    # seen across all envs across all rollouts. Quantifies depth/breadth of
+    # exploration over time — useful for measuring "deep exploration" gains
+    # from posterior sampling.
+    unique_positions_global = set()
 
     global_step = 0
     global_update = 0
@@ -253,6 +335,7 @@ def main():
             next_inv_l = []
             died_l = []
             goal_l = []
+            pos_keys_l = []
             for i, parent_conn in enumerate(parent_conns):
                 s, r, d, rd, lr, extras = parent_conn.recv()
                 next_states_l.append(s)
@@ -266,6 +349,7 @@ def main():
                         'inventory_vec', np.zeros(inventory_dim, dtype=np.float32)))
                 died_l.append(bool(extras.get('died', False)))
                 goal_l.append(bool(extras.get('reached_goal', False)))
+                pos_keys_l.append(extras.get('pos_key', (0, 0, 0)))
 
             next_states = np.stack(next_states_l)
             rewards = np.array(rewards_l, dtype=np.float32)
@@ -277,10 +361,41 @@ def main():
             died = np.array(died_l)
             goal = np.array(goal_l)
 
-            # 2. Intrinsic reward
+            # Global state-coverage update (cheap; ~8 set adds per step).
+            for pk in pos_keys_l:
+                unique_positions_global.add(pk)
+
+            # 2. Intrinsic reward (RND base; optional NovelD difference form;
+            # optional Option B gate). NovelD's visit-count multiplier and
+            # SimHash additive bonus are applied below since they depend on
+            # per-env state.
             norm_next_obs = ((next_obs - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)
             intrinsic_reward, target_features = agent.compute_intrinsic_reward(
-                norm_next_obs, next_inv, gate=gate if use_option_b else None)
+                norm_next_obs, next_inv,
+                prev_obs=prev_norm_next_obs if use_noveld else None,
+                prev_inventory=prev_next_inventories if use_noveld else None,
+                gate=gate if use_option_b else None)
+
+            # NovelD episodic visit-count multiplier (per-env).
+            if use_noveld and noveld_counters is not None:
+                count_mults = np.empty(num_worker, dtype=np.float32)
+                for i in range(num_worker):
+                    if use_noveld_clusters and noveld_clusterer is not None:
+                        cluster_id = noveld_clusterer.cluster_id(target_features[i])
+                        key = ('cluster', cluster_id) if cluster_id >= 0 else ('cluster', '__none__')
+                        noveld_clusterer.add(target_features[i])
+                    else:
+                        key = pos_keys_l[i]
+                    count_mults[i] = noveld_counters[i].visit_and_multiplier(key)
+                intrinsic_reward = intrinsic_reward * count_mults
+
+            # SimHash additive bonus (per-run hash counter, shared across envs).
+            if use_simhash and simhash_counter is not None:
+                sh_bonuses = np.empty(num_worker, dtype=np.float32)
+                for i in range(num_worker):
+                    sh_bonuses[i] = simhash_counter.visit_and_bonus(
+                        norm_next_obs[i].reshape(-1))
+                intrinsic_reward = intrinsic_reward + simhash_lambda * sh_bonuses
 
             # 3. DSC bonus (distance-based, normalized by running mean).
             #    Multiplicative on top of the gated RND bonus. When type-
@@ -314,6 +429,9 @@ def main():
                     deaths_recent.append(int(died[i]))
                     goals_recent.append(int(goal[i]))
                     episode_returns[i] = 0.0
+                    # NovelD episodic counter resets on real episode boundary
+                    if noveld_counters is not None:
+                        noveld_counters[i].reset()
             if len(episode_ext_returns_recent) > log_window:
                 episode_ext_returns_recent = episode_ext_returns_recent[-log_window:]
                 deaths_recent = deaths_recent[-log_window:]
@@ -338,6 +456,10 @@ def main():
             states = next_states
             if inventory_dim > 0:
                 inventories = next_inv
+            if use_noveld:
+                prev_norm_next_obs = norm_next_obs
+                if inventory_dim > 0:
+                    prev_next_inventories = next_inv
 
         # Bootstrap value at the end
         _, value_ext, value_int, _ = agent.get_action(
@@ -354,6 +476,20 @@ def main():
             if steps_since_recluster >= cluster_refresh_steps and anchor_buffer.filled > 0:
                 anchor_buffer.recluster()
                 steps_since_recluster = 0
+
+        # Periodic K-means recluster (NovelD cluster-types)
+        if use_noveld and use_noveld_clusters and noveld_clusterer is not None:
+            steps_since_noveld_recluster += num_worker * num_step
+            if steps_since_noveld_recluster >= cluster_refresh_steps and noveld_clusterer.filled > 0:
+                noveld_clusterer.recluster()
+                steps_since_noveld_recluster = 0
+
+        # Posterior sampling: resample active heads at the end of each
+        # rollout. (Approximates per-episode resampling; could be made strictly
+        # per-episode by tracking head-per-step but rollout granularity is
+        # sufficient for trajectory-level diversification.)
+        if use_posterior_sampling:
+            active_heads = np.random.randint(0, num_ext_critics, size=num_worker)
 
         # ----- Reshape rollout -----
         total_state = np.stack(rollout_state).transpose([1, 0, 2, 3, 4]).reshape([-1, 4, 84, 84])
@@ -393,9 +529,22 @@ def main():
             target_ext[..., k] = t_k.reshape(num_worker, num_step)
         target_ext_flat = target_ext.reshape(-1, K)
 
-        # Pessimistic V_ext for advantage
-        v_ext_pess = total_ext_values.min(axis=-1)
-        _, ext_adv = make_train_data(total_reward, total_done, v_ext_pess,
+        # Extrinsic advantage. Three modes for combining the K critic heads:
+        #   - Option B: pessimistic min(V_k) → conservative, suppresses positive
+        #     signals on sparse-reward tasks (documented failure mode).
+        #   - Posterior sampling: per-env active head's value → trajectory-level
+        #     value-model diversity → "deep exploration" without suppression.
+        #   - Default: mean across heads (effectively no different from single
+        #     critic when K=1, but acts as a mild regularizer when K>1).
+        if use_option_b:
+            v_ext_combined = total_ext_values.min(axis=-1)
+        elif use_posterior_sampling:
+            v_ext_combined = np.zeros((num_worker, num_step + 1), dtype=np.float32)
+            for i in range(num_worker):
+                v_ext_combined[i] = total_ext_values[i, :, active_heads[i]]
+        else:
+            v_ext_combined = total_ext_values.mean(axis=-1)
+        _, ext_adv = make_train_data(total_reward, total_done, v_ext_combined,
                                       gamma, num_step, num_worker)
 
         # Intrinsic targets (non-episodic per RND paper)
@@ -411,7 +560,7 @@ def main():
         norm_next_obs_batch = ((total_next_obs - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)
 
         # Training
-        agent.train_model(
+        train_diag = agent.train_model(
             np.float32(total_state) / 255., target_ext_flat, int_target,
             total_action, total_adv, norm_next_obs_batch, rollout_policy,
             inventory_batch=total_inventory,
@@ -445,6 +594,31 @@ def main():
             if use_clusters:
                 writer.add_scalar('data/cluster_count',
                                   float(anchor_buffer.cluster_filled), global_step)
+        if use_noveld and noveld_counters is not None:
+            avg_unique = float(np.mean([c.unique_count() for c in noveld_counters]))
+            writer.add_scalar('data/noveld_unique_keys_per_env', avg_unique, global_step)
+            if use_noveld_clusters and noveld_clusterer is not None:
+                writer.add_scalar('data/noveld_cluster_count',
+                                  float(noveld_clusterer.cluster_filled), global_step)
+        if use_simhash and simhash_counter is not None:
+            writer.add_scalar('data/simhash_unique_hashes',
+                              float(simhash_counter.unique_count()), global_step)
+        if use_posterior_sampling:
+            # Ensemble V_ext disagreement at the active states this rollout.
+            writer.add_scalar('data/posterior_v_ext_spread',
+                              float(total_ext_values.std(axis=-1).mean()), global_step)
+        # Deep-exploration breadth metric: total unique (x, y, dir) keys
+        # visited across all envs and all rollouts so far. Higher = broader
+        # coverage of the state space; useful for measuring whether
+        # posterior sampling produces deeper exploration than per-step
+        # curiosity alone.
+        writer.add_scalar('data/unique_positions_seen',
+                          float(len(unique_positions_global)), global_step)
+
+        # PPO diagnostics (Part 2 rubric: loss curves, entropy, KL)
+        if train_diag is not None:
+            for k, v in train_diag.items():
+                writer.add_scalar(f'train/{k}', float(v), global_step)
 
         if global_update % 10 == 0:
             now = time.time()

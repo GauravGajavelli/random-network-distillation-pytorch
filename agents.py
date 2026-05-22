@@ -40,11 +40,15 @@ class RNDAgent:
             use_option_b=False,
             num_ext_critics=1,
             bootstrap_p=0.8,
-            gate_alpha=1.0,
+            gate_alpha=0.5,
+            gate_floor=0.2,
             # DSC
             use_dsc=False,
             num_anchors=64,
             dsc_lambda=0.5,
+            # NovelD
+            use_noveld=False,
+            noveld_alpha=0.5,
             # inventory fusion
             inventory_dim=0,
     ):
@@ -64,17 +68,23 @@ class RNDAgent:
         self.device = get_device(use_cuda)
 
         self.use_option_b = use_option_b
-        self.num_ext_critics = num_ext_critics if use_option_b else 1
+        # K > 1 if any consumer of the ensemble is enabled (Option B's
+        # pessimistic min OR posterior sampling per-rollout head selection).
+        self.num_ext_critics = num_ext_critics if num_ext_critics > 0 else 1
         self.bootstrap_p = bootstrap_p
         self.gate_alpha = gate_alpha
+        self.gate_floor = gate_floor
         # EMA running mean of ensemble variance — used to normalize the gate
-        # so it can approach 0 in low-variance (well-known) regions and ~1 in
-        # high-variance (novel) regions, regardless of absolute scale.
+        # so it can approach `gate_floor` in low-variance (well-known) regions
+        # and ~1 in high-variance (novel) regions, regardless of absolute scale.
         self._var_ema = None
 
         self.use_dsc = use_dsc
         self.num_anchors = num_anchors
         self.dsc_lambda = dsc_lambda
+
+        self.use_noveld = use_noveld
+        self.noveld_alpha = noveld_alpha
 
         self.inventory_dim = inventory_dim
 
@@ -143,20 +153,51 @@ class RNDAgent:
             self._var_ema = 0.99 * self._var_ema + 0.01 * batch_mean
         ref = max(self._var_ema, 1e-6)
         gate = var / (var + ref)
-        gate = np.clip(self.gate_alpha * gate, 0.0, 1.0)
+        # Floor at gate_floor so the intrinsic exploration signal is never
+        # fully suppressed — important on sparse-reward tasks where critic
+        # variance is uniformly small (no extrinsic signal to disagree about)
+        # and the gate would otherwise close everywhere.
+        gate = np.clip(self.gate_alpha * gate, self.gate_floor, 1.0)
         return gate.astype(np.float32)
 
-    def compute_intrinsic_reward(self, next_obs, next_inventory=None, gate=None):
-        next_obs_t = self._to_t(next_obs)
-        inv_t = self._to_t(next_inventory) if (next_inventory is not None and self.inventory_dim > 0) else None
+    def _rnd_mse(self, obs, inventory):
+        """Forward RND target + predictor on a single-channel obs batch.
+
+        Returns the MSE intrinsic reward [N] and the target features [N, 512].
+        Pure numpy outputs.
+        """
+        obs_t = self._to_t(obs)
+        inv_t = self._to_t(inventory) if (inventory is not None and self.inventory_dim > 0) else None
         with torch.no_grad():
-            target_feature = self.rnd.target_forward(next_obs_t, inv_t)
-            predict_feature = self.rnd.predictor_forward(next_obs_t, inv_t)
-            intrinsic_reward = (target_feature - predict_feature).pow(2).sum(1) / 2
-        r = intrinsic_reward.detach().cpu().numpy()
+            target_feature = self.rnd.target_forward(obs_t, inv_t)
+            predict_feature = self.rnd.predictor_forward(obs_t, inv_t)
+            mse = (target_feature - predict_feature).pow(2).sum(1) / 2
+        return mse.detach().cpu().numpy(), target_feature.detach().cpu().numpy()
+
+    def compute_intrinsic_reward(self, next_obs, next_inventory=None, gate=None,
+                                  prev_obs=None, prev_inventory=None):
+        """Compute the per-step intrinsic reward.
+
+        - Base signal: RND MSE on next_obs.
+        - If use_noveld and prev_obs is provided: NovelD difference form
+          `max(rnd_next - alpha * rnd_prev, 0)`. The visit-count multiplier
+          and SimHash additive bonus are applied in train.py (per-env state).
+        - If gate is provided (Option B): multiplied into the final signal.
+
+        Returns (intrinsic_reward [N], target_features [N, 512]).
+        """
+        rnd_next, target_feature = self._rnd_mse(next_obs, next_inventory)
+
+        if self.use_noveld and prev_obs is not None:
+            rnd_prev, _ = self._rnd_mse(prev_obs, prev_inventory)
+            r = np.maximum(rnd_next - self.noveld_alpha * rnd_prev, 0.0)
+        else:
+            r = rnd_next
+
         if gate is not None:
             r = r * gate
-        return r, target_feature.detach().cpu().numpy()
+
+        return r, target_feature
 
     # -----------------------------------------------------------------
     # Training
@@ -195,6 +236,11 @@ class RNDAgent:
             log_prob_old = m_old.log_prob(y_batch)
 
         K = self.num_ext_critics
+
+        # Accumulators for diagnostic metrics returned to the caller for logging.
+        diag = {'actor_loss': 0.0, 'critic_ext_loss': 0.0, 'critic_int_loss': 0.0,
+                'forward_loss': 0.0, 'entropy': 0.0, 'approx_kl': 0.0}
+        diag_steps = 0
 
         for _ in range(self.epoch):
             np.random.shuffle(sample_range)
@@ -250,4 +296,20 @@ class RNDAgent:
                     + list(self.rnd.predictor_cnn.parameters())
                     + list(self.rnd.predictor_head.parameters()))
                 self.optimizer.step()
+
+                # Diagnostics: mean per mini-batch step. approx_kl is the
+                # standard "old vs new" KL approximation used in PPO papers.
+                with torch.no_grad():
+                    diag['actor_loss'] += float(actor_loss.item())
+                    diag['critic_ext_loss'] += float(critic_ext_loss.item())
+                    diag['critic_int_loss'] += float(critic_int_loss.item())
+                    diag['forward_loss'] += float(forward_loss.item())
+                    diag['entropy'] += float(entropy.item())
+                    diag['approx_kl'] += float((log_prob_old[sample_idx] - log_prob).mean().item())
+                diag_steps += 1
+
+        if diag_steps > 0:
+            for k in diag:
+                diag[k] /= diag_steps
+        return diag
 
