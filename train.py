@@ -51,6 +51,8 @@ def main():
     env_type = default_config['EnvType']
 
     use_cuda = default_config.getboolean('UseGPU')
+    use_amp = default_config.getboolean('UseAMP', fallback=False)
+    cudnn_benchmark = default_config.getboolean('CudnnBenchmark', fallback=False)
     use_gae = default_config.getboolean('UseGAE')
     use_noisy_net = default_config.getboolean('UseNoisyNet')
     load_model = default_config.getboolean('LoadModel', fallback=False)
@@ -174,13 +176,19 @@ def main():
     print(f"env={env_id}  output_size={output_size}  inventory_dim={inventory_dim}")
     print(f"use_option_b={use_option_b} K={num_ext_critics}  use_dsc={use_dsc}")
 
+    # CUDA-specific backend settings (no-ops on CPU/MPS).
+    if torch.cuda.is_available() and use_cuda:
+        if cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')  # TF32 on Ampere+; no-op on Turing
+
     # Agent
     agent = RNDAgent(
         input_size, output_size, num_worker, num_step, gamma,
         lam=lam, learning_rate=learning_rate, ent_coef=entropy_coef,
         clip_grad_norm=clip_grad_norm, epoch=epoch, batch_size=batch_size,
         ppo_eps=ppo_eps, use_cuda=use_cuda, use_gae=use_gae,
-        use_noisy_net=use_noisy_net,
+        use_noisy_net=use_noisy_net, use_amp=use_amp,
         use_option_b=use_option_b, num_ext_critics=num_ext_critics,
         bootstrap_p=bootstrap_p, gate_alpha=gate_alpha, gate_floor=gate_floor,
         use_dsc=use_dsc, num_anchors=num_anchors, dsc_lambda=dsc_lambda,

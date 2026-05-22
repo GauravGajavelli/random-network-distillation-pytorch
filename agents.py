@@ -36,6 +36,7 @@ class RNDAgent:
             use_gae=True,
             use_cuda=False,
             use_noisy_net=False,
+            use_amp=False,
             # Option B
             use_option_b=False,
             num_ext_critics=1,
@@ -66,6 +67,8 @@ class RNDAgent:
         self.clip_grad_norm = clip_grad_norm
         self.update_proportion = update_proportion
         self.device = get_device(use_cuda)
+        self.use_amp = use_amp and (self.device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
 
         self.use_option_b = use_option_b
         # K > 1 if any consumer of the ensemble is enabled (Option B's
@@ -248,54 +251,62 @@ class RNDAgent:
                 sample_idx = sample_range[self.batch_size * j:self.batch_size * (j + 1)]
                 idx_t = torch.from_numpy(sample_idx).long().to(self.device)
 
-                # RND predictor loss
-                target_next = self.rnd.target_forward(
-                    next_obs_batch[sample_idx],
-                    next_inv_t[sample_idx] if next_inv_t is not None else None)
-                predict_next = self.rnd.predictor_forward(
-                    next_obs_batch[sample_idx],
-                    next_inv_t[sample_idx] if next_inv_t is not None else None)
-                forward_loss = forward_mse(predict_next, target_next.detach()).mean(-1)
-                mask = (torch.rand(len(forward_loss), device=self.device) < self.update_proportion).float()
-                forward_loss = (forward_loss * mask).sum() / mask.sum().clamp(min=1.0)
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    # RND predictor loss
+                    target_next = self.rnd.target_forward(
+                        next_obs_batch[sample_idx],
+                        next_inv_t[sample_idx] if next_inv_t is not None else None)
+                    predict_next = self.rnd.predictor_forward(
+                        next_obs_batch[sample_idx],
+                        next_inv_t[sample_idx] if next_inv_t is not None else None)
+                    forward_loss = forward_mse(predict_next, target_next.detach()).mean(-1)
+                    mask = (torch.rand(len(forward_loss), device=self.device) < self.update_proportion).float()
+                    forward_loss = (forward_loss * mask).sum() / mask.sum().clamp(min=1.0)
 
-                # Policy + critic
-                inv_sample = inv_t[sample_idx] if inv_t is not None else None
-                policy, value_ext, value_int = self.model(s_batch[sample_idx], inv_sample)
-                # value_ext: [b, K]; value_int: [b, 1]
+                    # Policy + critic
+                    inv_sample = inv_t[sample_idx] if inv_t is not None else None
+                    policy, value_ext, value_int = self.model(s_batch[sample_idx], inv_sample)
+                    # value_ext: [b, K]; value_int: [b, 1]
 
-                m = Categorical(F.softmax(policy, dim=-1))
-                log_prob = m.log_prob(y_batch[sample_idx])
-                ratio = torch.exp(log_prob - log_prob_old[sample_idx])
+                    m = Categorical(F.softmax(policy, dim=-1))
+                    log_prob = m.log_prob(y_batch[sample_idx])
+                    ratio = torch.exp(log_prob - log_prob_old[sample_idx])
 
-                surr1 = ratio * adv_batch[sample_idx]
-                surr2 = torch.clamp(ratio, 1.0 - self.ppo_eps, 1.0 + self.ppo_eps) * adv_batch[sample_idx]
-                actor_loss = -torch.min(surr1, surr2).mean()
+                    surr1 = ratio * adv_batch[sample_idx]
+                    surr2 = torch.clamp(ratio, 1.0 - self.ppo_eps, 1.0 + self.ppo_eps) * adv_batch[sample_idx]
+                    actor_loss = -torch.min(surr1, surr2).mean()
 
-                # Extrinsic critic loss: per-head MSE w/ per-sample bootstrap masks
-                # target_ext_batch shape: [B, K]
-                tgt = target_ext_batch[sample_idx]
-                if K > 1:
-                    # Bernoulli(p) per (sample, head) mask
-                    bmask = (torch.rand_like(value_ext) < self.bootstrap_p).float()
-                    per_head_loss = ((value_ext - tgt) ** 2) * bmask
-                    critic_ext_loss = per_head_loss.sum() / bmask.sum().clamp(min=1.0)
-                else:
-                    critic_ext_loss = F.mse_loss(value_ext.squeeze(-1), tgt.squeeze(-1))
+                    # Extrinsic critic loss: per-head MSE w/ per-sample bootstrap masks
+                    # target_ext_batch shape: [B, K]
+                    tgt = target_ext_batch[sample_idx]
+                    if K > 1:
+                        # Bernoulli(p) per (sample, head) mask
+                        bmask = (torch.rand_like(value_ext) < self.bootstrap_p).float()
+                        per_head_loss = ((value_ext - tgt) ** 2) * bmask
+                        critic_ext_loss = per_head_loss.sum() / bmask.sum().clamp(min=1.0)
+                    else:
+                        critic_ext_loss = F.mse_loss(value_ext.squeeze(-1), tgt.squeeze(-1))
 
-                critic_int_loss = F.mse_loss(value_int.squeeze(-1), target_int_batch[sample_idx])
-                critic_loss = critic_ext_loss + critic_int_loss
-                entropy = m.entropy().mean()
+                    critic_int_loss = F.mse_loss(value_int.squeeze(-1), target_int_batch[sample_idx])
+                    critic_loss = critic_ext_loss + critic_int_loss
+                    entropy = m.entropy().mean()
 
-                loss = actor_loss + 0.5 * critic_loss - self.ent_coef * entropy + forward_loss
+                    loss = actor_loss + 0.5 * critic_loss - self.ent_coef * entropy + forward_loss
 
+                params = (list(self.model.parameters())
+                          + list(self.rnd.predictor_cnn.parameters())
+                          + list(self.rnd.predictor_head.parameters()))
                 self.optimizer.zero_grad()
-                loss.backward()
-                global_grad_norm_(
-                    list(self.model.parameters())
-                    + list(self.rnd.predictor_cnn.parameters())
-                    + list(self.rnd.predictor_head.parameters()))
-                self.optimizer.step()
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    global_grad_norm_(params)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    global_grad_norm_(params)
+                    self.optimizer.step()
 
                 # Diagnostics: mean per mini-batch step. approx_kl is the
                 # standard "old vs new" KL approximation used in PPO papers.

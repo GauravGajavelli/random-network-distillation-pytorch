@@ -4,6 +4,13 @@ import os
 config = configparser.ConfigParser()
 config.read('./config.conf')
 
+# CONFIG_EXTRA: optional second config file whose [DEFAULT] values override the
+# primary config.conf. Used by cuda/ run scripts to inject UseAMP, CudnnBenchmark,
+# etc. without duplicating every experiment section. Later reads win on conflict.
+extra = os.environ.get('CONFIG_EXTRA', '').strip()
+if extra:
+    config.read(extra)
+
 # ---------------------------------
 # Section selection
 # Set CONFIG_SECTION=<section> to pick a non-default section.
