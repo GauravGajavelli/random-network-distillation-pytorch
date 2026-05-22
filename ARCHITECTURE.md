@@ -1,18 +1,31 @@
 # Architecture: Augmenting RND with Option B + DSC
 
+> **Historical document.** This file covers the Option B + DSC design, which
+> was the plan for Experiments 1–3 before multi-seed analysis revealed
+> Option B's mechanism was inoperative in sparse-reward settings and DSC was
+> subsumed by simpler methods. The **final shipped enhancements** are
+> **NovelD-with-cluster-types**, **SimHash+RND**, and **Posterior Sampling**,
+> documented in § 6 at the bottom and in `reports/rnd_enhancement_constraints.md`.
+>
+> Sections 1–5 remain accurate as a record of what was built and why some
+> choices were made; they are part of the "challenges" and "design evolution"
+> narrative for the presentation. Do not read them as the current architecture.
+
 This document describes the architectural changes made on top of the original
 RND implementation and the specific failure mode each one addresses. It assumes
 familiarity with the RND paper (Burda et al., 2018) and the failure-mode
 catalogue documented in the plan file.
 
-The two interventions, both of which **augment** RND (the frozen target and
-trained predictor are unchanged), are:
+The two interventions covered in §§ 1–3, both of which **augment** RND (the
+frozen target and trained predictor are unchanged), are:
 
 - **Option B**: bootstrap-ensemble extrinsic critics + variance-gated intrinsic
-  reward. The foundational change; applied to baselines and interventions
-  alike so DSC's contribution can be isolated.
+  reward. Evaluated as the primary enhancement; empirically found to be
+  inoperative in the sparse-reward + curiosity regime (see § 6 and
+  `reports/option_b/option_b_writeup.md`).
 - **DSC** (Discriminative Subgoal Curiosity): a distance-based, anchor-ranked
-  bonus multiplied on top of the gated RND signal.
+  bonus. Implemented and tested; ultimately subsumed by NovelD+SimHash on the
+  measured metrics.
 
 ---
 
@@ -870,26 +883,52 @@ serving as an anti-saturation backstop for the RND signal.
 
 ## Weakness coverage (post-fixes)
 
-The baseline is different in each experiment: Experiments 1 and 2 compare
-vanilla RND against RND+Option B (testing Option B itself); Experiment 3
-compares RND+Option B against RND+Option B+DSC (isolating DSC's contribution).
+See § 6 for the final shipped enhancements. This table covers the original
+Option B + DSC plan. The Option B row is accurate as implemented; the DSC
+row reflects intended design rather than primary shipped result.
 
-| Weakness | Vanilla RND | Option B | DSC (over Option B) |
+| Weakness | Vanilla RND | Option B | NovelD + SimHash (shipped) |
 |---|---|---|---|
-| User #1 short-term bias | — | — | **fixes** — rank weight biases reward to frontier; bonus does not decay |
-| User #2 no episodic memory | — | — | partial — anchors are per-env, reservoir-sampled |
-| User #3 dancing with skulls | — | partial — pessimistic `min(V_ext_k)` demotes deadly-but-novel | partial — old anchors get low rank weight, no reward for loitering |
-| #4 local-only exploration | — | — | **fixes** — anchor sequence forms discoverable global structure |
-| #5 recurrent policies hurt | — | — | — |
-| #6 discount asymmetry fragility | — | — | — (optional ablation only) |
-| #7 normalization fragility | — | partial — EMA-normalized gate replaces a heuristic | partial — EMA-normalized distance |
-| #8 batch-size saturation | — | — | — |
-| #9 Pitfall failure | — | **fixes** — per-head MLPs produce real variance → real pessimism on deadly novel states | — |
-| #9 Gravitar failure | — | **fixes** — gate fully suppresses intrinsic in mature regions; self-extinguishing | — |
-| #10 episodic/non-episodic combination | — | — | partial — adds another episodic-style signal; combination still heuristic |
-| #11 target memorization on stochastic states | — | — | — |
-| #12 predictor saturation over long runs | — | partial — gate stays open in genuinely novel regions | **fixes** — distance bonus independent of predictor MSE |
+| #3 dancing with skulls (Pitfall) | — | Coded but inoperative — variance ≈ 0 pre-reward; see § 6 | **partial** — SimHash count suppresses re-visits to lava; NovelD episodic bonus disfavors already-explored regions |
+| #9 Gravitar failure | — | Gate uniformly attenuates 5× (not state-specific) | Not directly addressed; IntCoef ablation is the cleanest fix |
+| #4 local-only exploration | — | — | **partial** — SimHash global count creates pressure toward globally-unvisited states |
+| #12 predictor saturation | — | partial | **partial** — SimHash signal is independent of predictor MSE |
+| #1, #2, #5, #6, #7, #8, #10, #11 | — | — | — (orthogonal to all interventions tested) |
 
-**Uncovered weaknesses** (5 of 12, plus the parallel-group's NGU work):
-- #5, #6, #8, #10, #11 are orthogonal to both interventions.
-- #2 is being addressed by the group's NGU effort.
+---
+
+## 6. Final shipped enhancements
+
+The following three enhancements replaced Option B + DSC as the primary
+interventions after multi-seed analysis. Full mechanism analysis and
+empirical results are in `reports/rnd_enhancement_constraints.md`.
+
+### 6.1 NovelD with K-means cluster types (Zhang et al. 2021 + cluster extension)
+
+**What it is**: At each step, the intrinsic reward is `max(RND(s') - α·RND(s), 0) × (1/sqrt(N(cluster_id(s'))))` where `cluster_id` is the nearest K=8 K-means center over the RND target features, and N is an episodic visit counter reset at each episode boundary.
+
+**Files**: `utils.py:FeatureClusterer`, `train.py` (episodic counter, periodic recluster every `ClusterRefreshSteps=4096` steps).
+
+**What it does**: Episodic count bonus suppresses re-exploration of already-visited feature-space regions within an episode. The cluster abstraction (K=8 over 512-d RND features) groups visually similar states, providing coarse semantic discrimination.
+
+**Empirical finding**: Best time-to-goal on LavaCrossing (563k, seed 0) and DoorKey (97.3k, seed 0). Adds noise on KeyCorridor where vanilla RND already works — time-to-goal 360k vs baseline 325k (FAIL). The failure is attributable to coarse granularity (K=8 too few distinct regions for KeyCorridor's layout) and episodic decay rate mismatched to the baseline's already-effective exploration.
+
+### 6.2 SimHash additive bonus (Tang et al. 2017)
+
+**What it is**: A 64-bit random-projection hash `h(s) = sign(A·flatten(obs))` (A is a fixed random matrix) maps each observation to a binary vector. A global visit counter N(h) accumulates across all episodes. The bonus `λ/sqrt(N(h))` is added to the RND intrinsic reward each step.
+
+**Files**: `utils.py:SimHashCounter`, `train.py` (global counter, additive combination with RND MSE).
+
+**What it does**: Provides per-step coverage bonus at near-pixel resolution (25k unique hashes on LavaCrossing over 1M steps; 2.9k on KeyCorridor over 1.5M steps). Never saturates within the training budget. Additive form cannot suppress the RND signal.
+
+**Empirical finding**: 16.5% faster convergence on KeyCorridor (n=3 matched seeds: 267.6k ±12.7k vs vanilla 320.5k ±3.6k). Consistent per-seed improvement (+13.5%, +21.2%, +14.8%). SimHash-only (without RND) fails completely — 0.000 extrinsic return at 1.5M steps despite 1.4M unique hash observations — confirming RND provides the essential directional signal and SimHash provides complementary coverage.
+
+### 6.3 Posterior Sampling (Osband et al. 2016)
+
+**What it is**: The K=5 extrinsic critic ensemble (built for Option B) is reused with a different aggregation: instead of pessimistic `min`, each env worker is assigned one randomly-sampled head index at the start of each rollout. That head's value estimate drives the extrinsic advantage for the entire rollout. Heads are resampled at rollout boundaries.
+
+**Files**: `train.py` (`active_heads` array, resampled per rollout via `np.random.randint`).
+
+**What it does**: Provides trajectory-level exploration commitment — each env "believes" in one value model for 128 steps, creating coherent episode-length behaviour diversity across the 8 workers. This is the mechanism Bootstrap DQN was originally designed for, as opposed to Option B's pessimistic use.
+
+**Empirical finding**: Slight improvement alone (288.8k vs 325.6k baseline on KeyCorridor, FAIL by 12% threshold). Catastrophic when stacked with NovelD — 580k vs 360k for NovelD alone (FAIL). The stacking failure occurs because NovelD's persistently high episodic bonus (int_reward 4.53 → 2.77) combined with per-rollout head commitment amplifies signal noise: the agent commits to one value estimate while receiving a noisy count bonus that doesn't align with that head's value landscape, producing inconsistent gradients that slow convergence.

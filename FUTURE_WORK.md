@@ -1,125 +1,118 @@
 # Future Work
 
-This document catalogs open directions for extending the current RND + Option B + DSC stack. It is organized from near-term incremental improvements to longer-horizon architectural changes.
+This document catalogs open directions from the current state of the project:
+RND + PPO baseline, with NovelD-clustered, SimHash+RND, and Posterior Sampling
+as the evaluated enhancements. It is organized by the structural constraints
+(C1–C5) in `reports/rnd_enhancement_constraints.md` that explain the pattern
+of what worked and what did not.
 
 ---
 
-## 1. Subgoal typing: from anonymous anchors to named subgoal categories
+## 1. Validate the granularity finding for NovelD (C2)
 
-### Current limitation
+**What we know**: NovelD-clustered with K=8 passes on LavaCrossing and DoorKey
+(small state spaces, 3–5 unique cluster keys visited per episode) but fails on
+KeyCorridor (time2goal 360k vs baseline 325k). The hypothesis is K=8 is too
+coarse for KeyCorridor's layout.
 
-DSC anchors are individual points in a 512-d RND target-network embedding. The `UseClusters` flag partially addresses this by running K-means over the anchor buffer, but the resulting cluster centers are still anonymous — we can say "this state is near cluster 3" but not "cluster 3 means *key acquired*."
+**What to test**: K-ablations — K=16, K=32, K=64 — on KeyCorridor with 3 seeds
+each. Config sections `EXP3_KEYCORRIDOR_NOVELD` already exists; add
+`EXP3_KEYCORRIDOR_NOVELD_K16`, `_K32`, `_K64` to `config.conf` with
+`NovelDNumClusters` set accordingly. The `data/noveld_unique_keys_per_env` TB
+metric is the primary diagnostic: if unique keys per episode rises to ≥10 at
+higher K, and time-to-goal improves, the C2 hypothesis is confirmed.
 
-The architecture document explicitly flags this gap:
-
-> *"Anchors are not types or categories. Each anchor is one specific point in a 512-d embedding, not a class or cluster center."*
-
-### What subgoal typing would look like
-
-A subgoal type is a predicate that is true of a set of states sharing a semantically meaningful property — door unlocked, key held, room entered. Getting there requires:
-
-1. **Labeled anchor clusters.** Run a second-pass classifier (or contrastive probe) over the anchor buffer that maps cluster IDs to human-readable labels. For MiniGrid environments, the ground-truth observation dict gives us these labels for free (object type, carried item, door state).
-
-2. **Type-conditional curiosity.** Instead of one DSC bonus, maintain a separate distance signal per subgoal type. Bonus for "how far from the nearest *door* anchor" is independent of "how far from the nearest *key* anchor." This gives the agent structured novelty across semantic dimensions rather than a single scalar distance.
-
-3. **Curriculum over types.** Sort subgoal types by their current discovery rate and prioritize the frontier type — the one being discovered but not yet mastered. This addresses weakness #1 (short-term bias) more directly than the current rank-weight heuristic.
-
----
-
-## 2. Skills: policies that navigate between subgoal types
-
-### Current limitation
-
-There is no policy that can be told "get to a state of type T." DSC modifies per-step reward but provides no mechanism for directed navigation to a specific subgoal. Reaching a new subgoal type is fully emergent from the curiosity bonus, not planned.
-
-> *"Goal-conditioned policies (which DO let you say 'navigate to anchor 4') would require additional architecture — a goal-conditioned value head, hindsight-experience-replay, or hierarchical options."* — ARCHITECTURE.md
-
-### Skill definition
-
-A **skill** (in the options-framework sense) is a triple `(I, π_g, β)`:
-- `I` — initiation set: the set of states from which the skill can be invoked.
-- `π_g` — a goal-conditioned policy that drives the agent toward subgoal type `g`.
-- `β` — termination condition: `β(s) = True` when the agent reaches any state of type `g`, or when a timeout expires.
-
-### How to build skills over subgoal types
-
-#### Step 1 — define subgoal types (prerequisite: § 1 above)
-
-Each subgoal type becomes a potential skill goal. For a KeyCorridor task the natural type set is:
-`{start, key_visible, key_picked_up, door_visible, door_unlocked, goal_reached}`.
-
-#### Step 2 — collect inter-type transitions via HER
-
-Run the current RND + DSC agent and log every episode as a sequence of subgoal-type visits. For each transition `(s_t, a_t, ..., s_{t+k})` where `s_{t+k}` is of a new type, record it as a training tuple for the goal-conditioned policy `π_g` with `g = type(s_{t+k})`. Apply **Hindsight Experience Replay (HER)** to relabel trajectories: any trajectory that ends at type `g'` can be relabeled as a successful demonstration for skill `g'`.
-
-#### Step 3 — train goal-conditioned value heads
-
-Augment the existing network with a goal-conditioned critic `V(s, g)` and a goal-conditioned actor `π(a | s, g)`. The goal `g` can be embedded as:
-- A one-hot vector over subgoal types (simple, requires fixed type set).
-- A prototype embedding: the mean anchor feature vector for type `g` (richer, generalizes to new types without architecture change).
-
-The prototype embedding approach integrates cleanly with the existing anchor buffer: `goal_embed = mean(features[cluster == g])`.
-
-#### Step 4 — compose skills into plans via a meta-controller
-
-A high-level meta-controller (a second PPO agent operating at a slower timescale) selects which skill to invoke at each decision point. It observes the current subgoal-type and the task structure (available subgoal types, which have been visited) and outputs a skill index.
-
-```
-Meta-controller (slow): [state_type_t] → skill g
-    ↓
-Skill π_g (fast):        [s_t, goal=g] → a_t, a_{t+1}, ..., until β(s) or timeout
-    ↓
-Subgoal buffer:          record (type_at_skill_start, g, steps_taken, success)
-```
-
-This is essentially a **two-level MAXQ / Option-Critic** architecture. The meta-controller's action space is the set of known subgoal types; its reward is the sparse extrinsic reward of the original task.
-
-#### Step 5 — intrinsic reward for skill transitions
-
-Retain the DSC bonus but apply it at the skill level: the bonus for invoking skill `g` is proportional to how long since type `g` was last reached (recency weight) and how many novel inter-type transitions the skill would produce. This prevents the meta-controller from looping on easy skills.
+**Position-keyed NovelD baseline**: `EXP1_LAVA_NOVELD_POS` and
+`EXP3_KEYCORRIDOR_NOVELD_POS` config sections exist but were never run. These
+are the natural comparison — fine-grained (one key per navigable tile) vs
+clustered. Expected: position keys solve C2 on both envs; cluster keys are only
+competitive when K ≈ number of semantic regions.
 
 ---
 
-## 3. Inter-type transition graph
+## 2. Multi-seed validation for NovelD (C3)
 
-Maintaining an explicit directed graph `G = (V, E)` where:
-- `V` = discovered subgoal types
-- `E` = `(type_i → type_j)` if the agent has ever transitioned between them
-- edge weight = empirical success rate of skill `π_{type_j}` when invoked from a state of `type_i`
+**What we know**: All NovelD results are single-seed (SEED=0). SimHash+RND and
+vanilla RND on KeyCorridor have 3 seeds each, confirming the 16.5% improvement
+is consistent (+13.5%, +21.2%, +14.8%). NovelD's PASS on LavaCrossing (563k,
+seed 0) and DoorKey (97.3k, seed 0) is a single data point each.
 
-This graph serves multiple purposes:
-- **Planning:** A* or Dijkstra over `G` gives a skill sequence for reaching the goal type from the current type.
-- **Curriculum:** edges with low success rates identify skills that need more training.
-- **Novelty detection:** a new subgoal type is an unseen node; a new skill path is an unseen edge. DSC-style bonuses can target edge novelty rather than state-space novelty.
-
----
-
-## 4. Uncovered RND weaknesses that skills address
-
-| Weakness | Current coverage | How skill-over-subgoal-types addresses it |
-|---|---|---|
-| #2 no episodic memory | partial (anchors are non-episodic) | Skill selection conditioned on subgoal-type visit history within episode gives genuine episodic memory |
-| #4 local-only exploration | fixed by DSC anchor sequence | Meta-controller can plan globally across the type graph; no longer emergent |
-| #5 recurrent policies hurt | unaddressed | Each skill can use a short-horizon recurrent policy; the meta-controller operates on type-level state (no long-range memory needed) |
-| #10 episodic/non-episodic combination | heuristic | Natural separation: skills are episodic (reset on termination), meta-controller is non-episodic |
+**What to test**: Run `EXP1_LAVA_NOVELD` and `EXP2_DOORKEY_NOVELD` at seeds 1
+and 2. Adds 4 runs. If NovelD's LavaCrossing improvement holds across seeds, it
+has the same evidential weight as the SimHash result. If it regresses, it raises
+the same multi-seed concern that weakened the Option B headline claim.
 
 ---
 
-## 5. Near-term experiments
+## 3. A C1-compliant gate: intrinsic-ensemble disagreement
 
-The following can be done incrementally without the full skill architecture:
+**What we know**: Option B's variance gate failed because ensemble disagreement
+on *extrinsic* critics requires reward before heads can diverge (C1 violation).
+The gate idea itself — suppress intrinsic in familiar states, let it fire in
+novel ones — is sound.
 
-| Experiment | What it tests | Config change |
-|---|---|---|
-| Labeled cluster probes on MiniGrid | Whether `NumClusters` K-means meaningfully separates semantic types | Add ground-truth label logging per anchor; measure cluster purity |
-| Per-type DSC bonus (additive) | Whether separating distance by type helps KeyCorridor vs. single-distance DSC | New `UseTypedDSC` flag; sum of per-type distance bonuses |
-| Prototype goal embedding (frozen policy) | Whether `mean(features[cluster == g])` is a useful goal representation for HER labeling | Off-policy evaluation only; no new training needed |
-| Subgoal-type visit sequence logging | Characterize the natural order types are discovered under current DSC | Add `type_visit_log` to TensorBoard; no policy change |
+**What to test**: Replace the K=5 extrinsic critic ensemble with K=5 parallel
+RND *predictor* networks (each trained on the same observations with different
+random seeds). Their prediction variance is non-trivial from step 0 (different
+initializations → different prediction errors). Gate the RND intrinsic reward
+by the variance across these K predictor outputs instead of across critic values.
+
+This is structurally equivalent to Pathak et al. 2019's Disagreement Curiosity
+applied as a *regulator* rather than a *generator* — the novel composition that
+Option B was trying to achieve, but using a C1-compliant signal.
+
+**Implementation cost**: ~100 lines in `agents.py` and `model.py`. Reuse the
+existing gate formula in `agents.py:gate_factor()` with a different variance
+source.
+
+---
+
+## 4. Stacking SimHash + NovelD (C3 + C2 interaction)
+
+**What we know**: Posterior + NovelD stacking was catastrophic (580k vs 360k).
+But that failure is attributable to Posterior Sampling's per-rollout head
+commitment amplifying NovelD's noise. SimHash + NovelD haven't been stacked.
+
+**What to test**: `EXP3_KEYCORRIDOR_SIMHASH` + `UseNovelD=True`. SimHash is
+additive (C4-safe) and never saturates (C3-safe). NovelD's episodic component
+provides within-episode freshness that SimHash's global count doesn't capture.
+If C2 is satisfied (use K=32 or position keys to avoid coarse-graining), the
+two methods address different failure modes and should be complementary. If it
+degrades, the episodic/global count interaction has an interference mechanism
+worth understanding.
+
+---
+
+## 5. Adaptive granularity (resolves C2 without K-tuning)
+
+**What we know**: Fixed-K clustering requires K to be calibrated per environment.
+SimHash avoids this with near-infinite resolution. A method that starts fine and
+coarsens only when needed would get the best of both.
+
+**What to test**: Online K-means that grows K over training (start K=4, double
+every `GrowthSteps` whenever the average cluster size exceeds a threshold).
+Alternatively: hierarchical counting — use both position keys (fine) and cluster
+keys (coarse) and combine their `1/sqrt(N)` multipliers additively. The
+hierarchical form requires no new training infrastructure; it's a one-line
+change to the key construction in `train.py:393`.
 
 ---
 
 ## 6. Longer-horizon directions
 
-- **Procedurally generated type sets.** For tasks with unknown structure (Atari), learn subgoal types from clustering without ground-truth labels, using a contrastive auxiliary loss to push temporally distant features apart and temporally close features together (similar to BYOL-Explore or SPR).
-- **Skill reuse across tasks.** If the same type graph (e.g., *pick up object → unlock door → reach goal*) appears in multiple environments, skills trained on one environment should transfer to another. This requires a factored type representation that abstracts away environment-specific visual details.
-- **Option-Critic end-to-end training.** Rather than the two-stage process above (train skills, then train meta-controller), train the full hierarchy jointly using the Option-Critic gradient, with subgoal types as a soft inductive bias rather than a hard constraint on the option set.
+- **Atari validation**: All results are on MiniGrid. The C1–C5 constraints are
+  derived from MiniGrid behavior; whether they hold on Montezuma's Revenge or
+  Pitfall (the original RND paper failures) is unknown. SimHash+RND on
+  Montezuma would be the most direct test of the C2/C3 claims at scale.
+
+- **Intrinsic-ensemble disagreement as the *source* of intrinsic reward**
+  (Disagreement Curiosity, Pathak et al. 2019): rather than gating RND with
+  predictor variance, replace RND MSE with predictor-ensemble variance
+  entirely. This satisfies C1 and C5 (predictor disagreement is higher near
+  novel states) and provides a natural decay as predictors converge. The
+  trade-off is losing RND's directional bias from normalized MSE.
+
+- **Global + episodic count combination**: A state's intrinsic bonus could use
+  `λ_global/sqrt(N_global(h)) + λ_episodic/sqrt(N_ep(h))` — global for
+  long-horizon pressure, episodic for within-episode freshness. This addresses
+  C3 without choosing between the two decay regimes.

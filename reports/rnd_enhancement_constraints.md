@@ -142,7 +142,7 @@ The "additive is safe" claim must be qualified: **additive to RND** is safe; **r
 |---|---|---|---|---|
 | Vanilla RND | 0.936 ±0.012 | 320.5k ±3.6k | 0.659 ±0.121 | — |
 | SimHash+RND | 0.944 ±0.004 | 267.6k ±12.7k | 0.006 ±0.001 | 3,013 ±115 |
-| SimHash-only | 0.000 ±0.000 | ∞ (all seeds) | 56.539 ±1.619 | 1,245,872 ±228,767 |
+| SimHash-only | 0.000 ±0.000 | ∞ (all seeds) | 56.437 ±1.759 | 1,386,233 ±30,884 |
 
 SimHash-only achieves zero extrinsic return across all three seeds despite accumulating 1.2M unique hash observations — more than 400× the state coverage of SimHash+RND. The agent explores maximally and exploits nothing. RND is not interchangeable with the hash bonus; it is the backbone that makes the hash bonus useful.
 
@@ -161,6 +161,43 @@ The practical rule: if a method is described as an "additive bonus to RND," veri
 | **C3: Decay slower than search horizon** | NovelD on KeyCorridor (episodic saturation adds noise to working baseline) | SimHash (global count), RND MSE (learning-rate decay) | Decay mechanism must outlast the agent's search time |
 | **C4: Additive to RND, not replacing it** | SimHash-only (removes RND backbone; extr=0.000 despite 1.2M unique hashes) | SimHash+RND (additive; 16.5% faster than vanilla) | Bonus must augment RND, not substitute for it |
 | **C5: Directed signal, not just coverage** | SimHash-only (coverage-only; max exploration, zero exploitation) | RND, SimHash+RND | Must create gradient toward reward, not just toward novelty |
+
+---
+
+## Stacking failure: Posterior Sampling + NovelD
+
+An instructive negative result beyond the three main constraints: stacking
+Posterior Sampling on top of NovelD-clustered on KeyCorridor produces
+**catastrophic degradation** — time-to-goal 580k vs 360k for NovelD alone and
+325k for vanilla RND.
+
+| Method | extr_return | time-to-goal | int_reward (tail) |
+|---|---|---|---|
+| Vanilla RND | 0.942 | 325.6k | 0.673 |
+| NovelD-clustered | 0.945 | 360.4k | 2.69 |
+| Posterior Sampling alone | 0.943 | 288.8k | 0.657 |
+| **Posterior + NovelD** | **0.945** | **580.6k** | **2.27** |
+
+The failure mechanism: NovelD-clustered on KeyCorridor already violates C3
+(its episodic bonus produces persistently high int_reward, 4.53 → 2.77, adding
+noise to the RND signal). Posterior Sampling compounds this by committing each
+env worker to one value head's estimate for 128 steps. When that head's value
+landscape disagrees with the noisy count signal — which it will, because the
+head was trained on different bootstrap samples and the NovelD bonus is keyed
+on cluster IDs rather than value-relevant states — the gradient updates push
+in inconsistent directions across rollouts. The result is not 0 + noise = noise;
+it is interference between two signals that each individually had a useful
+structure but jointly cancel it out.
+
+**The practical rule**: when stacking bonuses or exploration mechanisms, the
+combination is safe only if the two signals are genuinely independent at the
+state level. Posterior Sampling's per-rollout head commitment makes it
+*sensitive to which signal drives advantage estimates*. Any noisy additive
+contribution to advantage (like a poorly-calibrated count bonus) will be
+amplified rather than averaged out. Posterior Sampling stacks safely with
+SimHash (which produces small, near-zero bonuses once the global count
+accumulates) but not with NovelD (which produces persistently large bonuses
+that dominate the advantage signal on already-explored tasks).
 
 ---
 
@@ -209,10 +246,74 @@ Before implementing an enhancement to RND, verify:
 
 ---
 
-## What was not tested
+## Completed runs summary
 
-- **K-ablations on NovelD clustering**: only K=8 was tested. K=32 or K=64 might satisfy C2 on KeyCorridor. The cluster-count is logged as `data/noveld_cluster_count` in TB.
-- **Position-keyed NovelD on LavaCrossing**: the `EXP1_LAVA_NOVELD_POS` config section exists in `config.conf` but the run is missing from `runs/`. Position keys would test whether finer granularity (50 distinct keys vs 8 cluster keys) produces different LavaCrossing behavior.
-- **Multi-seed runs for NovelD**: Exp 1-3 NovelD results are single-seed (SEED=0). SimHash+RND and vanilla RND on KeyCorridor now have 3 seeds each (confirming the 16.5% convergence improvement is consistent: +13.5%, +21.2%, +14.8% per seed).
-- **SimHash-only ablation**: ~~untested~~ — completed. `runs/exp3_keycorridor_simhash_only_seed{0,1,2}`. Result: 0.000 ±0.000 extrinsic return, ∞ time-to-goal across all 3 seeds. Documented under C4 and C5 above.
-- **Independent CNN trunks per critic head**: would increase ensemble diversity for Option B but does not address the root cause (C1: value disagreement requires reward signal).
+All planned experiments are finished. 26 run directories in `runs/`; full
+results from `python scripts/eval_summary.py` and `python scripts/eval_simhash.py`.
+
+### Multi-seed results now complete
+
+**KeyCorridor — SimHash+RND vs vanilla RND (n=3 matched seeds)**
+
+| Seed | Vanilla RND | SimHash+RND | Improvement |
+|---|---|---|---|
+| 0 | 325.6k | 281.6k | +13.5% |
+| 1 | 318.5k | 250.9k | +21.2% |
+| 2 | 317.4k | 270.3k | +14.8% |
+| **mean ±std** | **320.5k ±3.6k** | **267.6k ±12.7k** | **+16.5%** |
+
+**KeyCorridor — SimHash-only ablation (n=3 seeds, `UseRNDBonus=False`)**
+
+| Metric | Result |
+|---|---|
+| extr_return | 0.000 ±0.000 (all seeds fail completely) |
+| time-to-goal | ∞ (never solved on any seed) |
+| int_reward (tail) | 56.437 ±1.759 (enormous — maximal exploration, zero exploitation) |
+| unique hashes (final) | 1,386,233 ±30,884 (>400× the coverage of SimHash+RND) |
+
+**LavaCrossing — vanilla RND multi-seed (n=3)**
+
+| Seed | extr_return | goal_rate | time-to-goal | death_rate |
+|---|---|---|---|---|
+| 0 | 0.001 | 0.002 | never | 0.801 |
+| 1 | 0.717 | 0.844 | 846.8k | 0.005 |
+| 2 | 0.395 | 0.489 | 986.1k | 0.045 |
+
+Seed 0 is the outlier — the catastrophic failure used to motivate Option B. Seeds 1
+and 2 both solve LavaCrossing eventually, establishing that vanilla RND is not
+fundamentally broken on this environment, only high-variance. This is the key
+context for interpreting the Option B "improvement": it was a comparison against
+the unlucky seed, not against the method at its typical performance.
+
+**LavaCrossing — Option B (p=0.5) multi-seed (n=2 additional seeds)**
+
+| Seed | extr_return | time-to-goal |
+|---|---|---|
+| 1 | 0.533 | 861.2k |
+| 2 | 0.510 | 934.9k |
+
+Option B at p=0.5 on seeds 1 and 2 is indistinguishable from vanilla RND on the
+same seeds — both converge at roughly 850–990k steps. This eliminates the
+bootstrap-mask probability as the cause of Option B's apparent seed-0 advantage.
+
+---
+
+## What remains untested
+
+- **K-ablations on NovelD clustering**: only K=8 was tested. K=16, K=32, or K=64
+  may satisfy C2 on KeyCorridor. Config sections can be added to `config.conf`
+  with `NovelDNumClusters` set accordingly; `data/noveld_unique_keys_per_env` in
+  TB is the primary diagnostic.
+- **Position-keyed NovelD**: `EXP1_LAVA_NOVELD_POS` and `EXP3_KEYCORRIDOR_NOVELD_POS`
+  config sections exist in `config.conf` but neither run exists. Position keys
+  (one key per navigable tile) are the natural fine-grained baseline for the
+  cluster-type variant, and the most direct test of the C2 hypothesis.
+- **Multi-seed NovelD**: all NovelD results are single-seed (SEED=0). Whether the
+  LavaCrossing and DoorKey PASS results hold across seeds is unknown.
+- **Posterior + SimHash stacking**: `eval_summary.py` marks this INCOMPLETE
+  (missing run). Posterior Sampling stacks badly with NovelD; whether it stacks
+  well with SimHash (which produces small additive bonuses that don't interfere
+  with per-rollout head commitment) is untested.
+- **Independent CNN trunks per critic head**: would increase Option B ensemble
+  diversity but does not address the root cause — value disagreement requires
+  reward signal regardless of architecture (C1).
