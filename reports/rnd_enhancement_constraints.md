@@ -87,9 +87,9 @@ On KeyCorridor, K=8 covers a more complex layout. The unique keys per env drops 
 
 The hash space never saturates: with 25k unique hashes covering 1M steps, each hash is visited ~40 times on average. New states continue to generate near-1.0 bonuses throughout training. The count is additive (not episodic), so the signal persists across episode boundaries.
 
-Result: SimHash **passes** on all three environments (time2goal: 281.6k on KeyCorridor vs 325.6k baseline, PASS).
+Result: **SimHash+RND passes** on all three environments (time2goal: 281.6k on KeyCorridor vs 325.6k baseline, PASS). SimHash alone without RND fails completely — see C5 below.
 
-**The resolution requirement is task-specific**: K=8 clusters pass on small envs and fail on a larger one. SimHash's near-infinite resolution passes everywhere. The practical implication is that fixed-K count-based methods require K to scale with the number of semantically distinct regions in the state space, which is not known in advance. Variable-resolution methods (SimHash, position keys, RND MSE) avoid this calibration problem.
+**The resolution requirement is task-specific**: K=8 clusters pass on small envs and fail on a larger one. SimHash's near-infinite resolution passes everywhere when combined with RND. The practical implication is that fixed-K count-based methods require K to scale with the number of semantically distinct regions in the state space, which is not known in advance. Variable-resolution methods (SimHash, position keys, RND MSE) avoid this calibration problem.
 
 ---
 
@@ -132,17 +132,35 @@ On KeyCorridor, NovelD produces persistently high int_reward throughout training
 
 ---
 
-## The three constraints summarized
+Two additional patterns visible in the data:
+
+**C4: Additive bonuses are safer than multiplicative modifications when added to a working base signal.** SimHash adds to `r_int`; when combined with RND the worst case is a small signal that adds noise but does not suppress the existing RND component. Option B's variance gate multiplies by a factor ≤ 1.0; on DoorKey it suppressed useful intrinsic reward even when it should not have. NovelD's multiplier `1/sqrt(N)` on the RND difference signal can similarly suppress a useful RND contribution. Where the existing signal is working, multiplicative/gating modifications risk removing it.
+
+The "additive is safe" claim must be qualified: **additive to RND** is safe; **replacing RND** with the additive bonus alone is not. A three-seed ablation (KeyCorridor, `UseRNDBonus=False`, SEED=0/1/2) measured SimHash without the RND component:
+
+| Condition | extr return | time-to-goal | int reward (tail) | unique hashes |
+|---|---|---|---|---|
+| Vanilla RND | 0.936 ±0.012 | 320.5k ±3.6k | 0.659 ±0.121 | — |
+| SimHash+RND | 0.944 ±0.004 | 267.6k ±12.7k | 0.006 ±0.001 | 3,013 ±115 |
+| SimHash-only | 0.000 ±0.000 | ∞ (all seeds) | 56.539 ±1.619 | 1,245,872 ±228,767 |
+
+SimHash-only achieves zero extrinsic return across all three seeds despite accumulating 1.2M unique hash observations — more than 400× the state coverage of SimHash+RND. The agent explores maximally and exploits nothing. RND is not interchangeable with the hash bonus; it is the backbone that makes the hash bonus useful.
+
+The practical rule: if a method is described as an "additive bonus to RND," verify that removing RND makes the method degenerate. If it does (as here), the method's value derives from its interaction with RND, not from the bonus itself.
+
+**C5: Coverage signal alone cannot solve sparse-reward tasks requiring directed search.** SimHash-only satisfies C1 (counts exist pre-reward), C2 (near-pixel resolution, 1.2M unique hashes), and C3 (global non-resetting count, never saturates) — yet fails completely (0.000 extrinsic, ∞ time-to-goal, 3 seeds). This rules out the three structural constraints as a complete explanation of failure. The missing property is **directionality**: the bonus must create a gradient that points toward the sparse reward, not merely toward unvisited states. RND's normalized prediction error has implicit direction because the predictor learns faster on frequently-visited states, making novel states near-the-goal reliably more rewarding than novel states far from it. A pure count-based signal treats all novel states identically. In environments where the goal requires navigating through a specific sequence of novel states (KeyCorridor's multi-room structure), undirected novelty-maximization will fill the hash table without ever committing to the goal-directed path.
+
+---
+
+## The five constraints summarized
 
 | Constraint | Failed by | Passed by | Mechanism |
 |---|---|---|---|
 | **C1: Signal exists pre-reward** | Option B (value disagreement) | NovelD, SimHash, RND | Use observation-domain signals only |
 | **C2: Granularity matches state space** | NovelD-clustered on KeyCorridor (K=8 too coarse) | SimHash (near-pixel resolution), NovelD on small envs | Resolution must match semantic regions |
 | **C3: Decay slower than search horizon** | NovelD on KeyCorridor (episodic saturation adds noise to working baseline) | SimHash (global count), RND MSE (learning-rate decay) | Decay mechanism must outlast the agent's search time |
-
-A fourth pattern visible in the data:
-
-**C4: Additive bonuses are safer than multiplicative modifications.** SimHash adds to `r_int`; the worst case is a small signal that adds noise but does not suppress the existing RND signal. Option B's variance gate multiplies by a factor ≤ 1.0; on DoorKey it suppressed useful intrinsic reward even when it should not have. NovelD's multiplier `1/sqrt(N)` on the RND difference signal can similarly suppress a useful RND contribution. Where the existing signal is working, multiplicative/gating modifications risk removing it.
+| **C4: Additive to RND, not replacing it** | SimHash-only (removes RND backbone; extr=0.000 despite 1.2M unique hashes) | SimHash+RND (additive; 16.5% faster than vanilla) | Bonus must augment RND, not substitute for it |
+| **C5: Directed signal, not just coverage** | SimHash-only (coverage-only; max exploration, zero exploitation) | RND, SimHash+RND | Must create gradient toward reward, not just toward novelty |
 
 ---
 
@@ -168,7 +186,16 @@ Before implementing an enhancement to RND, verify:
    - If multiplicative (gate, count multiplier on existing signal), verify on a small env that the existing intrinsic signal is not suppressed in regions where it is known to be useful.  
    - If additive, the worst case is noise; the enhancement is self-limiting.
 
-**5. Does the enhancement create a cold-start period?**  
+**5. Is the bonus additive to RND, or does it replace RND?**  
+   - Additive (SimHash+RND): RND remains the directional backbone; bonus provides complementary coverage. If bonus is removed, performance degrades gracefully to vanilla RND.  
+   - Replacement (SimHash-only, IntCoef=0 + count bonus): the agent has no learning-based directional signal. Empirically: 0.000 extrinsic return at 1.5M steps on KeyCorridor vs 0.936 for vanilla RND. Never use a count-based bonus as the sole intrinsic signal on sparse-reward tasks.
+
+**6. Does the bonus provide directional signal or only coverage signal?**  
+   - Coverage-only bonuses (hash count, position count) treat all novel states identically. In tasks where the goal lies at the end of a specific sequence of novel states, the agent may fill the count table without finding the goal.  
+   - Directional bonuses (RND MSE, forward-dynamics prediction error) decay faster on frequently-visited states near the goal's approach path, implicitly biasing toward productive exploration.  
+   - Safe combination: coverage bonus (addresses C2/C3) + directional bonus (addresses C5). This is exactly the SimHash+RND design.
+
+**7. Does the enhancement create a cold-start period?**  
    - Methods that require a warm-up buffer (K-means clustering, anchor buffers, EMA initialization) will fall back to a degenerate behavior during the warm-up. Verify that the fallback is neutral (e.g., all states map to a single key, producing uniform bonus) rather than harmful (e.g., gate closes completely).  
    - In this codebase: `FeatureClusterer.cluster_id()` returns `-1` when `cluster_filled == 0`, which maps to `('cluster', '__none__')` in `train.py:393`. All envs share this key during cold-start, so the `1/sqrt(N)` multiplier drops to near-zero within the first rollout (~1024 visits to the same key). The cold-start lasts `ClusterRefreshSteps=4096` env steps — negligible at 1M-step budgets, but visible in early int_reward plots.
 
@@ -186,5 +213,6 @@ Before implementing an enhancement to RND, verify:
 
 - **K-ablations on NovelD clustering**: only K=8 was tested. K=32 or K=64 might satisfy C2 on KeyCorridor. The cluster-count is logged as `data/noveld_cluster_count` in TB.
 - **Position-keyed NovelD on LavaCrossing**: the `EXP1_LAVA_NOVELD_POS` config section exists in `config.conf` but the run is missing from `runs/`. Position keys would test whether finer granularity (50 distinct keys vs 8 cluster keys) produces different LavaCrossing behavior.
-- **Multi-seed runs for NovelD/SimHash**: all Exp 1-3 results are single-seed (SEED=0). The multi-seed analysis was done only for vanilla RND and Option B on LavaCrossing.
+- **Multi-seed runs for NovelD**: Exp 1-3 NovelD results are single-seed (SEED=0). SimHash+RND and vanilla RND on KeyCorridor now have 3 seeds each (confirming the 16.5% convergence improvement is consistent: +13.5%, +21.2%, +14.8% per seed).
+- **SimHash-only ablation**: ~~untested~~ — completed. `runs/exp3_keycorridor_simhash_only_seed{0,1,2}`. Result: 0.000 ±0.000 extrinsic return, ∞ time-to-goal across all 3 seeds. Documented under C4 and C5 above.
 - **Independent CNN trunks per critic head**: would increase ensemble diversity for Option B but does not address the root cause (C1: value disagreement requires reward signal).

@@ -2,8 +2,6 @@
 logs
 *.log
 __pycache__/
-models/
-runs/
 # Runtime data
 pids
 *.pid
@@ -34,5 +32,3 @@ lib/
 .idea
 *.iml
 /.venv
-/runs_1
-/models_1

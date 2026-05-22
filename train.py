@@ -109,6 +109,7 @@ def main():
     use_simhash = default_config.getboolean('UseSimHash', fallback=False)
     simhash_lambda = float(default_config.get('SimHashLambda', '0.5'))
     simhash_dim = int(default_config.get('SimHashDim', '64'))
+    use_rnd_bonus = default_config.getboolean('UseRNDBonus', fallback=True)
 
     # Posterior sampling. Uses NumExtCritics critics; per-env active head
     # is resampled at the start of each rollout. Mutually exclusive with
@@ -383,6 +384,9 @@ def main():
                 prev_obs=prev_norm_next_obs if use_noveld else None,
                 prev_inventory=prev_next_inventories if use_noveld else None,
                 gate=gate if use_option_b else None)
+
+            if not use_rnd_bonus:
+                intrinsic_reward[:] = 0.0
 
             # NovelD episodic visit-count multiplier (per-env).
             if use_noveld and noveld_counters is not None:
